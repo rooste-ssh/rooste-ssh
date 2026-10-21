@@ -33,7 +33,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 eframe = "0.36.2"
 egui = "0.36.2"
-egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
 insta = "1.49.0"
 egui_tiles = "0.17.1"
 keyring = "4.2.0"
