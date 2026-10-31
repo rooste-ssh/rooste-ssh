@@ -682,9 +682,13 @@ fn render_readme() {
     });
     shot("keygen", Theme::Dark, 720.0, &|harness| {
         harness.get_by_label("Tools").click();
-        harness.step();
+        for _ in 0..3 {
+            harness.step();
+        }
         harness.get_by_label("Key generator…").click();
-        harness.step();
+        for _ in 0..3 {
+            harness.step();
+        }
         if let Some(rooste_ssh::app::Dialog::KeyGenerator(generator)) =
             &mut harness.state_mut().dialog
         {

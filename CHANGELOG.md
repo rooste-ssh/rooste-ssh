@@ -6,7 +6,14 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A scrollbar in the terminal: drag it, or click to jump anywhere in the scrollback.
+
 ### Changed
+
+- The mouse wheel scrolls three lines per notch instead of one.
+- Dialogs highlight their main button in blue, and in red when it deletes or closes something.
 
 - Updated dependencies, including egui 0.37. Some small icons changed so that they all come from
   the app's own fonts (`×`, `⏷`, `🔘`, `⏺`) instead of depending on the system's fonts.

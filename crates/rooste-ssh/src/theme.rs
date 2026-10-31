@@ -37,6 +37,57 @@ pub fn spacing(style: &mut egui::Style) {
     s.menu_spacing = 4.0;
 }
 
+/// `add` with buttons in white on `fills` (normal, hovered, pressed).
+fn colored_buttons<R>(
+    ui: &mut egui::Ui,
+    fills: [egui::Color32; 3],
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        let states = [
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+        ];
+        for (state, fill) in states.into_iter().zip(fills) {
+            state.weak_bg_fill = fill;
+            state.bg_fill = fill;
+            state.bg_stroke = egui::Stroke::NONE;
+            state.fg_stroke.color = egui::Color32::WHITE;
+        }
+        add(ui)
+    })
+    .inner
+}
+
+/// `add` with buttons styled as a dialog's main action.
+pub fn primary<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    use egui::Color32;
+    let fills = [
+        Color32::from_rgb(29, 95, 200),
+        Color32::from_rgb(43, 112, 222),
+        Color32::from_rgb(22, 78, 170),
+    ];
+    colored_buttons(ui, fills, add)
+}
+
+/// A dialog's main action.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    primary(ui, |ui| ui.button(text))
+}
+
+/// A dialog's main action when it destroys something.
+pub fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    use egui::Color32;
+    let fills = [
+        Color32::from_rgb(190, 40, 40),
+        Color32::from_rgb(212, 56, 56),
+        Color32::from_rgb(160, 30, 30),
+    ];
+    colored_buttons(ui, fills, |ui| ui.button(text))
+}
+
 /// The frame of side panels (sessions, files).
 pub fn side_panel_frame(ctx: &egui::Context) -> egui::Frame {
     egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(10)

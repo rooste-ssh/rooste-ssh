@@ -25,6 +25,12 @@ pub struct ViewOutput {
 
 /// Gap between the terminal text and the edges of its area.
 const PADDING: f32 = 6.0;
+/// Room for the scrollbar at the terminal's right edge.
+const SCROLLBAR_WIDTH: f32 = 12.0;
+const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+/// Lines of scrollback per mouse wheel notch.
+const WHEEL_LINES: f32 = 3.0;
 /// Key in egui's data: some terminal is waiting to take the keyboard focus.
 const FOCUS_PENDING: &str = "rooste-terminal-focus-pending";
 
@@ -52,6 +58,8 @@ pub struct TerminalView {
     /// Mouse button currently held while reporting to the application.
     reported_button: Option<MouseButton>,
     selecting: bool,
+    /// While dragging the scrollbar: where the thumb was grabbed, from its top.
+    scrollbar_grab: Option<f32>,
     /// Take keyboard focus as soon as possible, e.g. when its tab is clicked.
     pub focus_requested: bool,
     /// Whether the terminal had keyboard focus when last shown.
@@ -70,6 +78,7 @@ impl Default for TerminalView {
             last_click: None,
             reported_button: None,
             selecting: false,
+            scrollbar_grab: None,
             focus_requested: false,
             has_focus: false,
         }
@@ -127,7 +136,7 @@ impl TerminalView {
             .fonts_mut(|f| vec2(f.glyph_width(&font, 'M'), f.row_height(&font)));
         let available = ui.available_size().max(cell + vec2(2.0, 2.0) * PADDING);
         // The text keeps a small gap from the edges; the background fills them.
-        let grid = available - vec2(2.0, 2.0) * PADDING;
+        let grid = available - vec2(2.0, 2.0) * PADDING - vec2(SCROLLBAR_WIDTH, 0.0);
 
         let cols = ((grid.x / cell.x).floor() as u16).max(1);
         let rows = ((grid.y / cell.y).floor() as u16).max(1);
@@ -140,11 +149,18 @@ impl TerminalView {
         // A fixed id, so the keyboard focus stays when widgets above the
         // terminal (find bar, status lines) come and go.
         let (rect, _) = ui.allocate_exact_size(available, Sense::hover());
+        let (text_rect, bar_rect) = rect.split_left_right_at_x(rect.right() - SCROLLBAR_WIDTH);
         let response = ui.interact(
-            rect,
+            text_rect,
             ui.make_persistent_id("terminal"),
             Sense::click_and_drag(),
         );
+        let bar = ui.interact(
+            bar_rect,
+            ui.make_persistent_id("scrollbar"),
+            Sense::click_and_drag(),
+        );
+        bar.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ScrollBar, true, "Scrollback"));
         let response = response.on_hover_cursor(egui::CursorIcon::Text);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Terminal, true, "Terminal"));
         let id = response.id;
@@ -186,7 +202,9 @@ impl TerminalView {
         if response.has_focus() {
             self.handle_keyboard(ui, term, &mut out);
         }
-        self.handle_mouse(ui, term, &response, metrics, &mut out);
+        let hovered = response.hovered() || bar.hovered();
+        self.handle_mouse(ui, term, &response, hovered, metrics, &mut out);
+        let thumb = self.scrollbar(term, &bar);
 
         if self.has_focus != response.has_focus() {
             // The tab bar, drawn before the terminal, shows which tab has
@@ -200,6 +218,17 @@ impl TerminalView {
             self.focus_requested = false;
         }
         self.paint(ui, rect, metrics, &term.screen(), self.has_focus);
+        if let Some(thumb) = thumb {
+            let widgets = &ui.visuals().widgets;
+            let fill = if bar.dragged() || bar.is_pointer_button_down_on() {
+                widgets.active.bg_fill
+            } else if bar.hovered() {
+                widgets.hovered.bg_fill
+            } else {
+                widgets.inactive.bg_fill
+            };
+            ui.painter_at(rect).rect_filled(thumb, 3.0, fill);
+        }
         out
     }
 
@@ -237,6 +266,7 @@ impl TerminalView {
         ui: &Ui,
         term: &mut Terminal,
         response: &Response,
+        hovered: bool,
         metrics: Metrics,
         out: &mut ViewOutput,
     ) {
@@ -340,16 +370,18 @@ impl TerminalView {
                 // Ctrl + wheel zooms instead of scrolling.
                 Event::MouseWheel {
                     delta, modifiers, ..
-                } if response.hovered() && modifiers.command => {
+                } if hovered && modifiers.command => {
                     if delta.y > 0.0 {
                         self.zoom_in();
                     } else if delta.y < 0.0 {
                         self.zoom_out();
                     }
                 }
-                Event::MouseWheel { unit, delta, .. } if response.hovered() => {
+                Event::MouseWheel { unit, delta, .. } if hovered => {
+                    // Programs with mouse reporting get one event per notch.
+                    let notch = if reporting { 1.0 } else { WHEEL_LINES };
                     let lines = match unit {
-                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * notch,
                         egui::MouseWheelUnit::Page => delta.y * rows as f32,
                         egui::MouseWheelUnit::Point => delta.y / metrics.cell.y,
                     };
@@ -400,6 +432,47 @@ impl TerminalView {
                 _ => {}
             }
         }
+    }
+
+    /// Follow the mouse on the scrollbar. Returns the thumb to draw, if there
+    /// is history to scroll through.
+    fn scrollbar(&mut self, term: &mut Terminal, bar: &Response) -> Option<Rect> {
+        let history = term.history_size();
+        if history == 0 || term.alt_screen() {
+            self.scrollbar_grab = None;
+            return None;
+        }
+        let track = bar.rect.shrink2(vec2(0.0, 2.0));
+        let rows = usize::from(term.size().1);
+        let height = (track.height() * rows as f32 / (history + rows) as f32)
+            .clamp(SCROLLBAR_MIN_THUMB.min(track.height()), track.height());
+        let travel = track.height() - height;
+        let top_for = |offset: usize| track.top() + travel * (1.0 - offset as f32 / history as f32);
+
+        match bar.interact_pointer_pos() {
+            Some(pos) if travel > 0.0 => {
+                let top = top_for(term.display_offset());
+                let grab = *self.scrollbar_grab.get_or_insert_with(|| {
+                    // On the thumb it stays under the pointer; on the track
+                    // it jumps there.
+                    if (top..=top + height).contains(&pos.y) {
+                        pos.y - top
+                    } else {
+                        height / 2.0
+                    }
+                });
+                let along = ((pos.y - grab - track.top()) / travel).clamp(0.0, 1.0);
+                let target = ((1.0 - along) * history as f32).round() as i32;
+                term.scroll(target - term.display_offset() as i32);
+                self.focus_requested = true;
+            }
+            _ => self.scrollbar_grab = None,
+        }
+        let x = bar.rect.center().x - SCROLLBAR_THUMB_WIDTH / 2.0;
+        Some(Rect::from_min_size(
+            pos2(x, top_for(term.display_offset())),
+            vec2(SCROLLBAR_THUMB_WIDTH, height),
+        ))
     }
 
     fn paint(&self, ui: &Ui, rect: Rect, metrics: Metrics, screen: &Screen, focused: bool) {

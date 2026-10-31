@@ -65,13 +65,22 @@ fn checkboxes(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.end_row();
 }
 
-fn buttons(ui: &mut Ui, accept: &str) -> (bool, bool) {
+/// Cancel and the main action, which `accept_button` draws.
+fn buttons_with(
+    ui: &mut Ui,
+    accept: &str,
+    accept_button: fn(&mut Ui, &str) -> egui::Response,
+) -> (bool, bool) {
     let mut result = (false, false);
     footer(ui, |ui| {
         result.1 = ui.button("Cancel").clicked();
-        result.0 = ui.button(accept).clicked();
+        result.0 = accept_button(ui, accept).clicked();
     });
     result
+}
+
+fn buttons(ui: &mut Ui, accept: &str) -> (bool, bool) {
+    buttons_with(ui, accept, crate::theme::primary_button)
 }
 
 /// Editing a profile, with string fields for parsing on save.
@@ -678,7 +687,7 @@ pub fn confirm(
             ui.set_max_width(420.0);
             ui.heading(title);
             ui.label(text);
-            let (yes, cancel) = buttons(ui, accept);
+            let (yes, cancel) = buttons_with(ui, accept, crate::theme::danger_button);
             if yes {
                 decision = Decision::Accept(());
             } else if cancel {
