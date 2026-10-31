@@ -170,8 +170,17 @@ fn context_menu(harness: &mut Harness<'_, RoosteApp>, profile: &str, item: &str)
     settle(harness);
     harness.get_by_label(profile).click_secondary();
     settle(harness);
-    // The welcome screen also has a "Connect" button; the menu item is last.
-    last(harness, item).click();
+    // The welcome screen also has a "Connect" button; the menu item is the
+    // one next to the session.
+    let session = harness.get_by_label(profile).rect().center();
+    harness
+        .get_all_by_label(item)
+        .min_by(|a, b| {
+            let distance = |node: &egui_kittest::Node<'_>| node.rect().center().distance(session);
+            distance(a).total_cmp(&distance(b))
+        })
+        .unwrap()
+        .click();
     settle(harness);
 }
 
@@ -896,7 +905,7 @@ fn sessions_can_be_recorded_for_playback() {
     harness.state_mut().picker.fake_answer = Some(cast.clone());
     open_menu_item(&mut harness, "Tab", "Record session…");
     settle(&mut harness);
-    assert!(first_tab(harness.state()).unwrap().title().contains('◉'));
+    assert!(first_tab(harness.state()).unwrap().title().contains('🔘'));
     harness.event(egui::Event::Text("on tape".into()));
     harness.key_press(egui::Key::Enter);
     let read = || std::fs::read_to_string(&cast).unwrap_or_default();
@@ -1316,7 +1325,7 @@ fn tunnel_editor_validates() {
     );
     assert!(
         harness
-            .query_all_by_label("Tunnel L 8080 → nohost: `nohost` has an invalid port")
+            .query_all_by_label("Tunnel L 8080 -> nohost: `nohost` has an invalid port")
             .next()
             .is_some()
     );
@@ -1879,4 +1888,17 @@ fn missing_serial_port_fails_clearly() {
         "failure",
         |app| matches!(first_tab(app).map(|t| &t.state), Some(TabState::Failed(m)) if m.contains("Could not open the serial port") && m.contains(port)),
     );
+}
+
+/// Icons must come from the bundled fonts: a symbol that only some system
+/// fonts have shows up as an empty box elsewhere.
+#[test]
+fn icons_are_in_the_bundled_fonts() {
+    let mut harness = Harness::new_ui(|_ui| {});
+    harness.step();
+    let font = egui::FontId::proportional(14.0);
+    for icon in "×⏷⏺🔘⬆⬇⟳➕−📁📄⚠📢✔✖".chars() {
+        let found = harness.ctx.fonts_mut(|fonts| fonts.has_glyph(&font, icon));
+        assert!(found, "{icon} (U+{:04X}) has no glyph", icon as u32);
+    }
 }

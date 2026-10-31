@@ -307,7 +307,7 @@ impl SessionTab {
                             .desired_width(240.0),
                     );
                     edit.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Find")
+                        egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Find")
                     });
                     if std::mem::take(&mut find.focus) {
                         edit.request_focus();
@@ -352,7 +352,7 @@ impl SessionTab {
                     if find.found == Some(false) {
                         ui.colored_label(ui.visuals().error_fg_color, "Not found");
                     }
-                    if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                    if ui.button("×").on_hover_text("Close (Esc)").clicked() {
                         close = true;
                     }
                 });
@@ -414,7 +414,11 @@ impl SessionTab {
         };
         let broadcast = if self.broadcast { "📢 " } else { "" };
         let logging = if self.log.is_some() { "⏺ " } else { "" };
-        let recording = if self.recording.is_some() { "◉ " } else { "" };
+        let recording = if self.recording.is_some() {
+            "🔘 "
+        } else {
+            ""
+        };
         format!(
             "{marker}{legacy}{broadcast}{logging}{recording}{}",
             self.name
@@ -810,7 +814,7 @@ impl SessionTab {
         }
         self.script_ui(ui);
         self.find_ui(ui);
-        let panel_id = egui::Id::new(("files", self.id));
+        let panel_id = egui::Id::unique(("files", self.id));
         if let Some(files) = &mut self.files {
             files.poll();
             egui::Panel::right(panel_id)

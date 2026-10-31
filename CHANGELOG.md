@@ -6,6 +6,16 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Updated dependencies, including egui 0.37. Some small icons changed so that they all come from
+  the app's own fonts (`×`, `⏷`, `🔘`, `⏺`) instead of depending on the system's fonts.
+
+### Security
+
+- Updated `crypto-bigint`, `ctutils`, `rustls-webpki` and `webpki-root-certs` for
+  RUSTSEC-2026-0387, RUSTSEC-2026-0385, RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
+
 ### Fixed
 
 - Exporting an ECDSA key to `.ppk` could write a file that couldn't be read back (about one

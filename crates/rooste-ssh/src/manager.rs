@@ -73,7 +73,7 @@ pub fn show(ui: &mut Ui, state: &mut ManagerState, profiles: &[Profile]) -> Opti
             .hint_text("Search")
             .desired_width(f32::INFINITY),
     );
-    search.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Search"));
+    search.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Search"));
     ui.separator();
 
     if profiles.is_empty() {
@@ -117,8 +117,7 @@ pub fn show(ui: &mut Ui, state: &mut ManagerState, profiles: &[Profile]) -> Opti
 fn background_menu(ui: &mut Ui, action: &mut Option<ManagerAction>) {
     let size = ui.available_size().max(egui::vec2(0.0, 40.0));
     let response = ui.allocate_response(size, egui::Sense::click());
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Session list"));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::List, true, "Session list"));
     response.context_menu(|ui| {
         let mut item = |ui: &mut Ui, label: &str, chosen: ManagerAction| {
             if ui.button(label).clicked() {

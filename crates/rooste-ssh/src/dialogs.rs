@@ -166,7 +166,7 @@ impl ProfileEditor {
         } else {
             "Edit session"
         };
-        Modal::new(Id::new("profile-editor"))
+        Modal::new(Id::unique("profile-editor"))
             .frame(crate::theme::dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.heading(title);
@@ -190,7 +190,7 @@ impl ProfileEditor {
                                     let layout = egui::Layout::right_to_left(egui::Align::Center);
                                     ui.allocate_ui_with_layout(size, layout, |ui| {
                                         if !folders.is_empty() {
-                                            ui.menu_button("▾", |ui| {
+                                            ui.menu_button("⏷", |ui| {
                                                 for folder in folders {
                                                     if ui.button(folder).clicked() {
                                                         p.folder = folder.clone();
@@ -353,7 +353,7 @@ fn serial_fields(ui: &mut Ui, port: &mut String, serial: &mut SerialSettings, po
                     })
                     .desired_width(270.0),
             );
-            ui.menu_button("▾", |ui| {
+            ui.menu_button("⏷", |ui| {
                 if ports.is_empty() {
                     ui.weak("No serial ports found");
                 }
@@ -435,21 +435,19 @@ fn tunnels_ui(ui: &mut Ui, tunnels: &mut Vec<Tunnel>) {
                     .hint_text("listen port")
                     .desired_width(110.0),
             )
-            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Listen"));
+            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Listen"));
             if tunnel.kind != TunnelKind::Dynamic {
-                ui.label("→");
+                ui.label("->");
                 ui.add(
                     egui::TextEdit::singleline(&mut tunnel.target)
                         .margin(crate::theme::FIELD_MARGIN)
                         .hint_text("host:port")
                         .desired_width(150.0),
                 )
-                .widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Target")
-                });
+                .widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Target"));
             }
             if ui
-                .small_button("✕")
+                .small_button("×")
                 .on_hover_text("Remove tunnel")
                 .clicked()
             {
@@ -483,7 +481,7 @@ pub struct SettingsEditor {
 impl SettingsEditor {
     pub fn show(&mut self, ctx: &egui::Context, picker: &mut Picker) -> Decision<Settings> {
         let mut decision = Decision::Pending;
-        Modal::new(Id::new("settings"))
+        Modal::new(Id::unique("settings"))
             .frame(crate::theme::dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.heading("Settings");
@@ -561,7 +559,7 @@ pub fn prompt(
     input: &mut String,
 ) -> Decision<String> {
     let mut decision = Decision::Pending;
-    Modal::new(Id::new("secret-prompt"))
+    Modal::new(Id::unique("secret-prompt"))
         .frame(crate::theme::dialog_frame(ctx))
         .show(ctx, |ui| {
             let (heading, label, hidden) = match kind {
@@ -638,7 +636,7 @@ pub fn prompt(
 /// Ask whether to trust an unknown host key.
 pub fn host_key(ctx: &egui::Context, key: &UnknownHostKey) -> Decision<()> {
     let mut decision = Decision::Pending;
-    Modal::new(Id::new("host-key"))
+    Modal::new(Id::unique("host-key"))
         .frame(crate::theme::dialog_frame(ctx))
         .show(ctx, |ui| {
             ui.set_max_width(460.0);
@@ -674,7 +672,7 @@ pub fn confirm(
     accept: &str,
 ) -> Decision<()> {
     let mut decision = Decision::Pending;
-    Modal::new(Id::new(id))
+    Modal::new(Id::unique(id))
         .frame(crate::theme::dialog_frame(ctx))
         .show(ctx, |ui| {
             ui.set_max_width(420.0);
