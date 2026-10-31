@@ -1584,7 +1584,7 @@ impl RoosteApp {
                     ui.allocate_ui_with_layout(size, layout, |ui| {
                         let connect =
                             egui::Button::new("Connect").min_size(egui::vec2(140.0, 32.0));
-                        submit |= ui.add(connect).clicked();
+                        submit |= crate::theme::primary(ui, |ui| ui.add(connect)).clicked();
                     });
                     if submit {
                         self.quick_connect(&ctx);
@@ -1799,7 +1799,7 @@ impl RoosteApp {
                         let mut cancel = false;
                         crate::dialogs::footer(ui, |ui| {
                             cancel = ui.button("Cancel").clicked();
-                            submit |= ui.button("Connect").clicked();
+                            submit |= crate::theme::primary_button(ui, "Connect").clicked();
                         });
                         if cancel || (submit && self.quick_connect(ctx)) {
                             keep = false;

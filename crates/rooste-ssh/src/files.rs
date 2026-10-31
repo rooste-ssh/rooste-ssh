@@ -883,7 +883,7 @@ impl FilesPanel {
                 .widget_info(|| {
                     egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Folder name")
                 });
-                if ui.button("Create").clicked() && !name.trim().is_empty() {
+                if crate::theme::primary_button(ui, "Create").clicked() && !name.trim().is_empty() {
                     command = Some(FilesCommand::Mkdir(rooste_sftp::join(
                         &self.cwd,
                         name.trim(),
@@ -899,7 +899,7 @@ impl FilesPanel {
                     .widget_info(|| {
                         egui::WidgetInfo::labeled(egui::Role::TextInput, true, "New name")
                     });
-                if ui.button("Rename").clicked() && !name.trim().is_empty() {
+                if crate::theme::primary_button(ui, "Rename").clicked() && !name.trim().is_empty() {
                     command = Some(FilesCommand::Rename {
                         from: from.clone(),
                         to: rooste_sftp::join(&rooste_sftp::parent(from), name.trim()),
@@ -912,7 +912,7 @@ impl FilesPanel {
             }
             Edit::Delete(entry) => {
                 ui.label(format!("Delete {}?", entry.name));
-                if ui.button("Delete").clicked() {
+                if crate::theme::danger_button(ui, "Delete").clicked() {
                     command = Some(FilesCommand::Remove {
                         path: entry.path.clone(),
                         dir: entry.is_dir(),

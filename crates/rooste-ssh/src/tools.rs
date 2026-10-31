@@ -148,7 +148,7 @@ impl KeyGenerator {
                     if ui.button("Cancel").clicked() {
                         decision = Decision::Cancel;
                     }
-                    if ui.button("Generate").clicked() {
+                    if crate::theme::primary_button(ui, "Generate").clicked() {
                         self.generate();
                     }
                 });
@@ -257,7 +257,7 @@ impl KeyConverter {
                     if ui.button("Close").clicked() {
                         decision = Decision::Cancel;
                     }
-                    if ui.button("Convert").clicked() {
+                    if crate::theme::primary_button(ui, "Convert").clicked() {
                         self.convert();
                     }
                 });
@@ -301,7 +301,7 @@ ui.add_space(10.0);
             match agent {
                 None => {
                     ui.label("The built-in agent holds your keys in memory and offers them when you log in.");
-                    if ui.button("Start agent").clicked() {
+                    if crate::theme::primary_button(ui, "Start agent").clicked() {
                         action = Some(AgentAction::Start);
                     }
                 }

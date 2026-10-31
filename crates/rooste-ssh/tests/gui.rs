@@ -1125,6 +1125,76 @@ fn switching_tabs_keeps_the_focus_out_of_the_other_half() {
     assert_eq!(split_focus(harness.state()), (false, true));
 }
 
+/// A connected session with 500 lines of scrollback.
+fn long_session(f: &Fixture) -> Harness<'static, RoosteApp> {
+    let mut harness = harness(app_with(f, vec![f.profile("one")]));
+    context_menu(&mut harness, "one", "Connect");
+    wait_for(&mut harness, "connected", |app| connected_count(app) == 1);
+    let tab = harness.state_mut().tabs_mut().next().unwrap();
+    for i in 0..500 {
+        tab.terminal.advance(format!("line {i}\r\n").as_bytes());
+    }
+    settle(&mut harness);
+    harness
+}
+
+fn scrolled_back(harness: &Harness<'_, RoosteApp>) -> usize {
+    first_tab(harness.state())
+        .unwrap()
+        .terminal
+        .display_offset()
+}
+
+#[test]
+fn a_mouse_wheel_notch_scrolls_three_lines() {
+    let f = Fixture::with_server();
+    let mut harness = long_session(&f);
+    harness.get_by_label("Terminal").hover();
+    settle(&mut harness);
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 1.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers: egui::Modifiers::default(),
+    });
+    settle(&mut harness);
+    assert_eq!(scrolled_back(&harness), 3);
+}
+
+#[test]
+fn the_scrollbar_jumps_and_drags_through_the_scrollback() {
+    let f = Fixture::with_server();
+    let mut harness = long_session(&f);
+    let bar = harness.get_by_label("Scrollback").rect();
+    let history = first_tab(harness.state()).unwrap().terminal.history_size();
+    assert!(history > 400);
+    let press = |harness: &mut Harness<'_, RoosteApp>, pos: egui::Pos2, pressed: bool| {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+        settle(harness);
+    };
+
+    // A click at the top of the track jumps to the oldest line.
+    let top = egui::pos2(bar.center().x, bar.top() + 3.0);
+    harness.event(egui::Event::PointerMoved(top));
+    settle(&mut harness);
+    press(&mut harness, top, true);
+    assert_eq!(scrolled_back(&harness), history);
+
+    // Dragging the thumb to the bottom returns to the newest line.
+    let bottom = egui::pos2(bar.center().x, bar.bottom() - 1.0);
+    harness.event(egui::Event::PointerMoved(bottom));
+    settle(&mut harness);
+    press(&mut harness, bottom, false);
+    assert_eq!(scrolled_back(&harness), 0);
+    assert!(first_tab(harness.state()).unwrap().view.has_focus);
+}
+
 #[test]
 fn broadcast_input_reaches_every_tab() {
     let f = Fixture::with_server();

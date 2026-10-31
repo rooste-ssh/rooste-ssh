@@ -764,7 +764,7 @@ impl SessionTab {
                                 );
                                 self.state = TabState::Failed(message);
                             }
-                            if ui.button("Reconnect now").clicked() {
+                            if crate::theme::primary_button(ui, "Reconnect now").clicked() {
                                 self.restart();
                             }
                         }
