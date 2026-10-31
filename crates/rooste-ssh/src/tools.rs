@@ -84,7 +84,7 @@ impl KeyGenerator {
 
     pub fn show(&mut self, ctx: &egui::Context, picker: &mut Picker) -> Decision<()> {
         let mut decision = Decision::Pending;
-        Modal::new(Id::new("key-generator"))
+        Modal::new(Id::unique("key-generator"))
             .frame(crate::theme::dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.heading("Key generator");
@@ -206,7 +206,7 @@ impl KeyConverter {
 
     pub fn show(&mut self, ctx: &egui::Context, picker: &mut Picker) -> Decision<()> {
         let mut decision = Decision::Pending;
-        Modal::new(Id::new("key-converter"))
+        Modal::new(Id::unique("key-converter"))
             .frame(crate::theme::dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.heading("Convert key");
@@ -295,7 +295,7 @@ impl AgentWindow {
     ) -> (Decision<()>, Option<AgentAction>) {
         let mut decision = Decision::Pending;
         let mut action = None;
-        Modal::new(Id::new("agent")).frame(crate::theme::dialog_frame(ctx)).show(ctx, |ui| {
+        Modal::new(Id::unique("agent")).frame(crate::theme::dialog_frame(ctx)).show(ctx, |ui| {
 ui.heading("SSH agent");
 ui.add_space(10.0);
             match agent {

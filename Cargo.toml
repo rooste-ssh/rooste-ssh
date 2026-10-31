@@ -31,11 +31,12 @@ base64ct = { version = "1.8.3", features = ["alloc"] }
 cbc = "0.2.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
-eframe = "0.36.2"
-egui = "0.36.2"
-egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }
+eframe = "0.37.0"
+# The bundled icons (➕, ⟳, 📁, …), so they look the same on every system.
+egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
 insta = "1.49.0"
-egui_tiles = "0.17.1"
+egui_tiles = "0.18.0"
 keyring = "4.2.0"
 proptest = "1.12.0"
 serial2-tokio = { version = "0.1.25", features = ["unix", "windows"] }

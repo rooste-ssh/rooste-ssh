@@ -158,8 +158,8 @@ impl Tunnel {
     /// Short description like `L 8080 → db:5432`.
     pub fn describe(&self) -> String {
         match self.kind {
-            TunnelKind::Local => format!("L {} → {}", self.listen, self.target),
-            TunnelKind::Remote => format!("R {} → {}", self.listen, self.target),
+            TunnelKind::Local => format!("L {} -> {}", self.listen, self.target),
+            TunnelKind::Remote => format!("R {} -> {}", self.listen, self.target),
             TunnelKind::Dynamic => format!("D {} (SOCKS)", self.listen),
         }
     }
@@ -305,7 +305,7 @@ mod tests {
         };
         assert_eq!(local.listen_addr().unwrap(), ("127.0.0.1".into(), 8080));
         assert_eq!(local.target_addr().unwrap(), ("db.internal".into(), 5432));
-        assert_eq!(local.describe(), "L 8080 → db.internal:5432");
+        assert_eq!(local.describe(), "L 8080 -> db.internal:5432");
         assert!(local.validate().is_ok());
 
         let any = Tunnel {

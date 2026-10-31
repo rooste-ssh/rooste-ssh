@@ -159,7 +159,7 @@ impl egui_tiles::Behavior<SessionTab> for TabBehavior {
         let font = egui::FontId::proportional(14.0);
         if tab.has_ended() {
             let red = egui::TextFormat::simple(font.clone(), egui::Color32::from_rgb(220, 80, 80));
-            job.append("● ", 0.0, red);
+            job.append("⏺ ", 0.0, red);
         }
         job.append(
             &tab.title(),
@@ -441,7 +441,7 @@ impl RoosteApp {
             config,
             config_path,
             secrets,
-            tree: Tree::empty("tabs"),
+            tree: Tree::empty(egui::Id::unique("tabs")),
             manager: ManagerState::default(),
             dialog: None,
             quick: ConnectForm::default(),
@@ -578,7 +578,7 @@ impl RoosteApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("✕")
+                            .small_button("×")
                             .on_hover_text("Hide until next start")
                             .clicked()
                         {
@@ -1552,7 +1552,7 @@ impl RoosteApp {
                     ui.hyperlink_to(label, url);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                    if ui.small_button("×").on_hover_text("Dismiss").clicked() {
                         self.notice = None;
                     }
                 });
@@ -1790,7 +1790,7 @@ impl RoosteApp {
             }
             Dialog::QuickConnect => {
                 let mut keep = true;
-                egui::Modal::new(egui::Id::new("quick-connect-dialog"))
+                egui::Modal::new(egui::Id::unique("quick-connect-dialog"))
                     .frame(crate::theme::dialog_frame(ctx))
                     .show(ctx, |ui| {
                         ui.heading("Quick connect");

@@ -109,7 +109,7 @@ pub fn show(
     commands: &[(String, Command)],
 ) -> Decision<Command> {
     let mut decision = Decision::Pending;
-    let response = Modal::new(Id::new("command-palette"))
+    let response = Modal::new(Id::unique("command-palette"))
         .frame(crate::theme::dialog_frame(ctx))
         .show(ctx, |ui| {
             ui.set_width(420.0);
@@ -119,9 +119,7 @@ pub fn show(
                     .hint_text("Type a command or session name")
                     .desired_width(f32::INFINITY),
             );
-            edit.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Command")
-            });
+            edit.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Command"));
             edit.request_focus();
             let matches = filter(commands, query);
             if ui.input(|i| i.key_pressed(egui::Key::Enter))

@@ -640,7 +640,7 @@ impl FilesPanel {
                     .desired_width(f32::INFINITY),
             );
             path.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Remote path")
+                egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Remote path")
             });
             if path.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let target = self.path_input.clone();
@@ -832,7 +832,7 @@ impl FilesPanel {
                                 .desired_width(100.0)
                                 .show_percentage(),
                         );
-                        if ui.small_button("✕").on_hover_text("Cancel").clicked() {
+                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
                             cancel = Some(transfer.id);
                         }
                     }
@@ -881,7 +881,7 @@ impl FilesPanel {
                         .desired_width(140.0),
                 )
                 .widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Folder name")
+                    egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Folder name")
                 });
                 if ui.button("Create").clicked() && !name.trim().is_empty() {
                     command = Some(FilesCommand::Mkdir(rooste_sftp::join(
@@ -897,7 +897,7 @@ impl FilesPanel {
             Edit::Rename { from, name } => {
                 ui.add(egui::TextEdit::singleline(name).desired_width(140.0))
                     .widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "New name")
+                        egui::WidgetInfo::labeled(egui::Role::TextInput, true, "New name")
                     });
                 if ui.button("Rename").clicked() && !name.trim().is_empty() {
                     command = Some(FilesCommand::Rename {
