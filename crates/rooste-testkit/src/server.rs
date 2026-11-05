@@ -360,12 +360,16 @@ impl server::Handler for ShellHandler {
         Ok(Auth::reject())
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
         if user == TEST_USER
             && self
                 .authorized
                 .iter()
-                .any(|k| k.key_data() == key.key_data())
+                .any(|k| k.key_data() == key.public_key.key_data())
         {
             self.user = user.to_owned();
             return Ok(Auth::Accept);

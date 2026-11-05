@@ -14,7 +14,6 @@ All notable changes are listed here. The format follows
 
 - The mouse wheel scrolls three lines per notch instead of one.
 - Dialogs highlight their main button in blue, and in red when it deletes or closes something.
-
 - Updated dependencies, including egui 0.37. Some small icons changed so that they all come from
   the app's own fonts (`×`, `⏷`, `🔘`, `⏺`) instead of depending on the system's fonts.
 
@@ -22,6 +21,10 @@ All notable changes are listed here. The format follows
 
 - Updated `crypto-bigint`, `ctutils`, `rustls-webpki` and `webpki-root-certs` for
   RUSTSEC-2026-0387, RUSTSEC-2026-0385, RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
+- Updated `russh` to 0.65. A malicious server could make the client use ever more memory
+  (GHSA-4p9f-7p9m-5vfg) or stall a channel's output (GHSA-fw5c-8223-6h42), and a program talking
+  to the built-in key agent could make it use ever more memory (GHSA-9wfm-jcj8-jfv9,
+  GHSA-662x-8wvj-2276).
 
 ### Fixed
 
