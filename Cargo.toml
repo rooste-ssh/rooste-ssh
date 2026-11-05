@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -14,11 +14,11 @@ authors = ["Martin Vooremäe"]
 [workspace.dependencies]
 # The internal crates are published to crates.io together with the app; keep
 # these versions equal to the workspace version above.
-rooste-core = { path = "crates/rooste-core", version = "=0.4.0" }
-rooste-protocols = { path = "crates/rooste-protocols", version = "=0.4.0" }
-rooste-terminal = { path = "crates/rooste-terminal", version = "=0.4.0" }
-rooste-keys = { path = "crates/rooste-keys", version = "=0.4.0" }
-rooste-sftp = { path = "crates/rooste-sftp", version = "=0.4.0" }
+rooste-core = { path = "crates/rooste-core", version = "=0.5.0" }
+rooste-protocols = { path = "crates/rooste-protocols", version = "=0.5.0" }
+rooste-terminal = { path = "crates/rooste-terminal", version = "=0.5.0" }
+rooste-keys = { path = "crates/rooste-keys", version = "=0.5.0" }
+rooste-sftp = { path = "crates/rooste-sftp", version = "=0.5.0" }
 # Test fixtures only; not published.
 rooste-testkit = { path = "crates/rooste-testkit" }
 
