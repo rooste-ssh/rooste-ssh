@@ -4,6 +4,13 @@ All notable changes are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- On Windows, the app and `rooste-cli` failed to start with a missing `VCRUNTIME140.dll` on
+  machines without the Visual C++ Redistributable. The runtime is now built into the executables.
+
 ## [0.5.0] - 2026-11-05
 
 ### Added

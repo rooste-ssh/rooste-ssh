@@ -10,6 +10,7 @@ on:
     paths:
       - packaging/**
       - about.toml
+      - .cargo/**
       - .github/workflows/release.yml
       - crates/rooste-ssh/Cargo.toml
 
@@ -210,6 +211,16 @@ jobs:
         shell: bash
         run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="rooste-ssh") | .version')" >> "$GITHUB_OUTPUT"
       - run: cargo build --release -p rooste-ssh -p rooste-cli
+      # Windows without the Visual C++ Redistributable has no VCRUNTIME140.dll;
+      # .cargo/config.toml links the C runtime in instead.
+      - name: Check the executables don't need the Visual C++ runtime
+        shell: pwsh
+        run: |
+          foreach ($exe in "target\release\rooste-ssh.exe", "target\release\rooste-cli.exe") {
+            if (Select-String -Path $exe -Pattern 'VCRUNTIME140' -SimpleMatch -Quiet) {
+              Write-Error "$exe imports VCRUNTIME140.dll"; exit 1
+            }
+          }
       - name: Sign executables
         if: env.HAS_CERTIFICATE == 'true'
         env:

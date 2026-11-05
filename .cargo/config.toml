@@ -1,0 +1,5 @@
+# Link the C runtime into Windows executables, so they run on machines without
+# the Visual C++ Redistributable (VCRUNTIME140.dll). The release workflow checks
+# that the executables don't import it.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
