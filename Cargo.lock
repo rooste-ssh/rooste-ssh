@@ -4569,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "serde",
@@ -4597,7 +4597,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-keys"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "argon2",
@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-protocols"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "base64ct",
@@ -4637,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-sftp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rooste-protocols",
  "rooste-testkit",
@@ -4649,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-ssh"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -4677,7 +4677,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-terminal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alacritty_terminal",
  "criterion",
@@ -4686,7 +4686,7 @@ dependencies = [
 
 [[package]]
 name = "rooste-testkit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "futures",
  "hex",
