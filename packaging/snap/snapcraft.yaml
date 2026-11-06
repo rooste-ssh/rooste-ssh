@@ -1,15 +1,15 @@
 # Snap built from the release binaries (see release.yml), like the Flatpak
-# bundle. Classic confinement: an SSH client needs ~/.ssh, the user's SSH
-# agent, the keyring, serial ports and any folder for SFTP transfers, which a
-# strictly confined snap can't reach. Classic snaps need approval from the
-# Snap Store before they can be published.
+# bundle. Strictly confined; some interfaces are connected manually for now:
+#   snap connect rooste-ssh:ssh-keys
+#   snap connect rooste-ssh:password-manager-service
+#   snap connect rooste-ssh:serial-port <slot>
 name: rooste-ssh
 title: Rooste SSH
 base: core24
 adopt-info: rooste-ssh
 license: MIT
 grade: stable
-confinement: classic
+confinement: strict
 icon: staging/icon-256.png
 website: https://github.com/rooste-ssh/rooste-ssh
 issues: https://github.com/rooste-ssh/rooste-ssh/issues
@@ -23,8 +23,26 @@ apps:
     command: bin/rooste-ssh
     desktop: usr/share/applications/rooste-ssh.desktop
     common-id: ee.prica.rooste-ssh
+    extensions: [gnome]
+    environment: &environment
+      # ~/.ssh (keys, known_hosts, config) is in the real home, reachable
+      # through ssh-keys; settings stay in the snap's own folder.
+      HOME: $SNAP_REAL_HOME
+      XDG_CONFIG_HOME: $SNAP_USER_DATA/.config
+      XDG_DATA_HOME: $SNAP_USER_DATA/.local/share
+      XDG_CACHE_HOME: $SNAP_USER_DATA/.cache
+    plugs: &plugs
+      - network
+      - network-bind
+      - home
+      - removable-media
+      - ssh-keys
+      - password-manager-service
+      - serial-port
   cli:
     command: bin/rooste-cli
+    environment: *environment
+    plugs: *plugs
 
 parts:
   rooste-ssh:
@@ -46,6 +64,5 @@ parts:
 
 lint:
   ignore:
-    # The binaries use the host's system libraries, as the .deb does.
-    - classic
+    # Libraries the binaries load at runtime come from the gnome extension.
     - library
