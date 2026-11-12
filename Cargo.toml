@@ -55,7 +55,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 md5 = "0.8.1"
 rand = "0.10.3"
-rfd = "0.17.2"
+rfd = "0.18.0"
 rhai = { version = "1.26.1", default-features = false, features = ["std"] }
 rpassword = "7.5.4"
 russh-sftp = "3.0.1"
