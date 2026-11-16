@@ -152,22 +152,16 @@ fn parse_u16_until(s: &str, delim: char) -> Result<(u16, &str), &'static str> {
 }
 
 fn parse_u16_prefix(s: &str) -> Result<(u16, &str), &'static str> {
-    let end = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if end == 0 {
         return Err("expected coordinate number");
     }
-    let val = s[..end]
-        .parse::<u16>()
-        .map_err(|_| "coordinate overflow")?;
+    let val = s[..end].parse::<u16>().map_err(|_| "coordinate overflow")?;
     Ok((val, &s[end..]))
 }
 
 fn parse_u32_prefix(s: &str) -> Result<(u32, &str), &'static str> {
-    let end = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if end == 0 {
         return Err("expected pane id");
     }

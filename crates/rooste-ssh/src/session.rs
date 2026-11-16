@@ -462,6 +462,15 @@ async fn dispatch_tmux_events<T: Transport>(
     Ok(detached)
 }
 
+async fn write_raw_text<T: Transport>(transport: &mut T, text: &str) -> Result<(), Failure> {
+    if !text.is_empty()
+        && let Err(e) = transport.write(text.as_bytes()).await
+    {
+        return Err(Failure::lost(format!("Connection lost: {e}")));
+    }
+    Ok(())
+}
+
 async fn handle_tmux_command<T: Transport>(
     command: SessionCommand,
     tmux: &mut Option<TmuxMachine>,
@@ -470,15 +479,6 @@ async fn handle_tmux_command<T: Transport>(
     client_size: &mut (u16, u16),
     sink: &EventSink,
 ) -> Result<bool, Failure> {
-    let write_raw = |transport: &mut T, text: String| async move {
-        if !text.is_empty()
-            && let Err(e) = transport.write(text.as_bytes()).await
-        {
-            return Err(Failure::lost(format!("Connection lost: {e}")));
-        }
-        Ok(())
-    };
-
     match command {
         SessionCommand::Input(data) => {
             if let Err(e) = transport.write(&data).await {
@@ -489,9 +489,9 @@ async fn handle_tmux_command<T: Transport>(
             *client_size = (cols.max(1), rows.max(1));
             if let Some(machine) = tmux.as_mut() {
                 machine.register_user_command();
-                write_raw(
+                write_raw_text(
                     transport,
-                    format!("refresh-client -C {}x{}\n", client_size.0, client_size.1),
+                    &format!("refresh-client -C {}x{}\n", client_size.0, client_size.1),
                 )
                 .await?;
             } else {
@@ -503,7 +503,7 @@ async fn handle_tmux_command<T: Transport>(
                 let cmd = encode_send_keys_hex(pane_id, &bytes);
                 if !cmd.is_empty() {
                     machine.register_user_command();
-                    write_raw(transport, cmd).await?;
+                    write_raw_text(transport, &cmd).await?;
                 }
             }
         }
@@ -516,7 +516,7 @@ async fn handle_tmux_command<T: Transport>(
                 let cmd = encode_paste_hex(pane_id, &text, bracketed);
                 if !cmd.is_empty() {
                     machine.register_user_command();
-                    write_raw(transport, cmd).await?;
+                    write_raw_text(transport, &cmd).await?;
                 }
             }
         }
@@ -524,9 +524,9 @@ async fn handle_tmux_command<T: Transport>(
             *client_size = (cols.max(20), rows.max(5));
             if let Some(machine) = tmux.as_mut() {
                 machine.register_user_command();
-                write_raw(
+                write_raw_text(
                     transport,
-                    format!("refresh-client -C {}x{}\n", client_size.0, client_size.1),
+                    &format!("refresh-client -C {}x{}\n", client_size.0, client_size.1),
                 )
                 .await?;
             }
@@ -538,9 +538,9 @@ async fn handle_tmux_command<T: Transport>(
         } => {
             if let Some(machine) = tmux.as_mut() {
                 machine.register_user_command();
-                write_raw(
+                write_raw_text(
                     transport,
-                    format!(
+                    &format!(
                         "resize-pane -t {} -x {} -y {}\n",
                         pane_id,
                         cols.max(2),
@@ -555,7 +555,7 @@ async fn handle_tmux_command<T: Transport>(
                 let cmd = action.to_command_string();
                 if !cmd.is_empty() {
                     machine.register_user_command();
-                    write_raw(transport, cmd).await?;
+                    write_raw_text(transport, &cmd).await?;
                 }
             }
         }
@@ -564,13 +564,13 @@ async fn handle_tmux_command<T: Transport>(
                 if force {
                     *tmux = None;
                     dcs.reset();
-                    write_raw(transport, "\ndetach-client\nstty sane\n".to_owned()).await?;
+                    write_raw_text(transport, "\ndetach-client\nstty sane\n").await?;
                     sink.send(SessionEvent::TmuxDetached {
                         reason: Some("force-exited tmux control mode".to_owned()),
                     });
                 } else {
                     // In `tmux -CC`, sending an empty line or `detach-client` cleanly detaches.
-                    write_raw(transport, "detach-client\n".to_owned()).await?;
+                    write_raw_text(transport, "detach-client\n").await?;
                 }
             }
         }

@@ -71,19 +71,11 @@ impl TmuxClientAction {
                 None => "new-window\n".to_owned(),
             },
             Self::SplitHorizontal { pane, cwd } => match cwd.as_deref().filter(|s| !s.is_empty()) {
-                Some(dir) => format!(
-                    "split-window -h -t {} -c {}\n",
-                    pane,
-                    escape_tmux_arg(dir)
-                ),
+                Some(dir) => format!("split-window -h -t {} -c {}\n", pane, escape_tmux_arg(dir)),
                 None => format!("split-window -h -t {}\n", pane),
             },
             Self::SplitVertical { pane, cwd } => match cwd.as_deref().filter(|s| !s.is_empty()) {
-                Some(dir) => format!(
-                    "split-window -v -t {} -c {}\n",
-                    pane,
-                    escape_tmux_arg(dir)
-                ),
+                Some(dir) => format!("split-window -v -t {} -c {}\n", pane, escape_tmux_arg(dir)),
                 None => format!("split-window -v -t {}\n", pane),
             },
             Self::KillPane { pane } => format!("kill-pane -t {}\n", pane),
@@ -119,8 +111,12 @@ enum PendingCmd {
     RefreshClientFlags,
     SubscribeFormats,
     ListWindows,
-    ListPanes { finalize_attach: bool },
-    CapturePane { pane: TmuxPaneId },
+    ListPanes {
+        finalize_attach: bool,
+    },
+    CapturePane {
+        pane: TmuxPaneId,
+    },
     UserCommand,
 }
 
@@ -317,8 +313,7 @@ impl TmuxMachine {
                 }
                 for line in &resp.lines {
                     let mut parts = line.splitn(7, '\t');
-                    let Some(window_id) =
-                        parts.next().and_then(|s| s.parse::<TmuxWindowId>().ok())
+                    let Some(window_id) = parts.next().and_then(|s| s.parse::<TmuxWindowId>().ok())
                     else {
                         continue;
                     };
@@ -431,6 +426,13 @@ impl TmuxMachine {
                 self.panes.retain(|_, p| p.window_id != window);
                 out.push(MachineEvent::Notification(notif));
             }
+            TmuxNotification::PaneExited { pane } => {
+                self.panes.remove(&pane);
+                for win in self.windows.values_mut() {
+                    win.panes.retain(|p| p.pane_id != pane);
+                }
+                out.push(MachineEvent::Notification(notif));
+            }
             TmuxNotification::WindowRenamed { window, ref name } => {
                 if let Some(win) = self.windows.get_mut(&window) {
                     win.name = name.clone();
@@ -438,9 +440,7 @@ impl TmuxMachine {
                 out.push(MachineEvent::Notification(notif));
             }
             TmuxNotification::LayoutChange {
-                window,
-                ref layout,
-                ..
+                window, ref layout, ..
             } => {
                 let mut unknown_pane = false;
                 for (pane_id, geom) in layout.panes() {

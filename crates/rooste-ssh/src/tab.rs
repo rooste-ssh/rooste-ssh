@@ -9,8 +9,7 @@ use rooste_core::Settings;
 use rooste_protocols::ssh::UnknownHostKey;
 use rooste_terminal::{Palette, PlainText, SearchDirection, TermEvent, Terminal};
 use rooste_tmux::{
-    TmuxClientAction, TmuxNotification, TmuxPaneId, TmuxSessionId, TmuxWindowId,
-    TmuxWindowSnapshot,
+    TmuxClientAction, TmuxNotification, TmuxPaneId, TmuxSessionId, TmuxWindowId, TmuxWindowSnapshot,
 };
 use tokio::sync::oneshot;
 
@@ -833,11 +832,7 @@ impl SessionTab {
     /// Handle session and terminal events, and due reconnects.
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.poll_script();
-        let events = self
-            .session
-            .as_ref()
-            .map(Session::poll)
-            .unwrap_or_default();
+        let events = self.session.as_ref().map(Session::poll).unwrap_or_default();
         for event in events {
             match event {
                 SessionEvent::Status(text) => self.state = TabState::Connecting(text),
@@ -1060,9 +1055,7 @@ impl SessionTab {
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("tmux -CC Gateway ({session_name})")).strong(),
-                    );
+                    ui.label(RichText::new(format!("tmux -CC Gateway ({session_name})")).strong());
                     if ui
                         .button("Detach (Esc)")
                         .on_hover_text("Detach cleanly and keep tmux running on the server")
@@ -1094,8 +1087,7 @@ impl SessionTab {
                             .hint_text("e.g. new-window -n logs")
                             .desired_width(240.0),
                     );
-                    let enter =
-                        edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if (ui.button("Run").clicked() || enter) && !custom_command.trim().is_empty() {
                         run_cmd = Some(std::mem::take(custom_command));
                     }

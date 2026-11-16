@@ -17,8 +17,10 @@ pub enum TmuxNotification {
     },
     /// `%window-add @window`
     WindowAdd { window: TmuxWindowId },
-    /// `%window-close @window`
+    /// `%window-close @window` or `%unlinked-window-close @window`
     WindowClose { window: TmuxWindowId },
+    /// `%pane-exited %pane`
+    PaneExited { pane: TmuxPaneId },
     /// `%window-renamed @window <new-name>`
     WindowRenamed { window: TmuxWindowId, name: String },
     /// `%window-pane-changed @window %pane`
@@ -140,70 +142,68 @@ impl ControlParser {
         }
 
         // Fast path for `%output %<id> <escaped>` using raw bytes before UTF-8 conversion.
-        if let Some(rest) = slice.strip_prefix(b"%output ") {
-            if let Some(notif) = parse_output_line(rest) {
-                events.push(TmuxEvent::Notification(notif));
-                return;
-            }
+        if let Some(rest) = slice.strip_prefix(b"%output ")
+            && let Some(notif) = parse_output_line(rest)
+        {
+            events.push(TmuxEvent::Notification(notif));
+            return;
         }
-        if let Some(rest) = slice.strip_prefix(b"%extended-output ") {
-            if let Some(notif) = parse_extended_output_line(rest) {
-                events.push(TmuxEvent::Notification(notif));
-                return;
-            }
+        if let Some(rest) = slice.strip_prefix(b"%extended-output ")
+            && let Some(notif) = parse_extended_output_line(rest)
+        {
+            events.push(TmuxEvent::Notification(notif));
+            return;
         }
 
         let line = String::from_utf8_lossy(slice);
         let line_ref = line.as_ref();
 
-        if let Some(args) = line_ref.strip_prefix("%begin ") {
-            if let Some((timestamp, command_num, flags)) = parse_block_header(args) {
-                self.active_block = Some(ActiveBlock {
-                    timestamp,
-                    command_num,
-                    flags,
-                    lines: Vec::new(),
-                });
-                return;
-            }
+        if let Some(args) = line_ref.strip_prefix("%begin ")
+            && let Some((timestamp, command_num, flags)) = parse_block_header(args)
+        {
+            self.active_block = Some(ActiveBlock {
+                timestamp,
+                command_num,
+                flags,
+                lines: Vec::new(),
+            });
+            return;
         }
 
-        if let Some(args) = line_ref.strip_prefix("%end ") {
-            if let Some((timestamp, command_num, flags)) = parse_block_header(args)
-                && let Some(block) = self.active_block.take()
-            {
-                events.push(TmuxEvent::Response(TmuxResponse {
-                    timestamp: timestamp.max(block.timestamp),
-                    command_num: if command_num != 0 {
-                        command_num
-                    } else {
-                        block.command_num
-                    },
-                    flags: flags.max(block.flags),
-                    lines: block.lines,
-                    is_error: false,
-                }));
-                return;
-            }
+        if let Some(args) = line_ref.strip_prefix("%end ")
+            && let Some((timestamp, command_num, flags)) = parse_block_header(args)
+            && let Some(block) = self.active_block.take()
+        {
+            events.push(TmuxEvent::Response(TmuxResponse {
+                timestamp: timestamp.max(block.timestamp),
+                command_num: if command_num != 0 {
+                    command_num
+                } else {
+                    block.command_num
+                },
+                flags: flags.max(block.flags),
+                lines: block.lines,
+                is_error: false,
+            }));
+            return;
         }
 
-        if let Some(args) = line_ref.strip_prefix("%error ") {
-            if let Some((timestamp, command_num, flags)) = parse_block_header(args)
-                && let Some(block) = self.active_block.take()
-            {
-                events.push(TmuxEvent::Response(TmuxResponse {
-                    timestamp: timestamp.max(block.timestamp),
-                    command_num: if command_num != 0 {
-                        command_num
-                    } else {
-                        block.command_num
-                    },
-                    flags: flags.max(block.flags),
-                    lines: block.lines,
-                    is_error: true,
-                }));
-                return;
-            }
+        if let Some(args) = line_ref.strip_prefix("%error ")
+            && let Some((timestamp, command_num, flags)) = parse_block_header(args)
+            && let Some(block) = self.active_block.take()
+        {
+            events.push(TmuxEvent::Response(TmuxResponse {
+                timestamp: timestamp.max(block.timestamp),
+                command_num: if command_num != 0 {
+                    command_num
+                } else {
+                    block.command_num
+                },
+                flags: flags.max(block.flags),
+                lines: block.lines,
+                is_error: true,
+            }));
+            return;
         }
 
         // Asynchronous notifications can arrive both outside and inside `%begin..%end`.
@@ -224,7 +224,10 @@ fn parse_block_header(args: &str) -> Option<(u64, u64, u32)> {
     let mut parts = args.split_whitespace();
     let ts = parts.next()?.parse::<u64>().ok()?;
     let num = parts.next()?.parse::<u64>().ok()?;
-    let flags = parts.next().and_then(|f| f.parse::<u32>().ok()).unwrap_or(1);
+    let flags = parts
+        .next()
+        .and_then(|f| f.parse::<u32>().ok())
+        .unwrap_or(1);
     Some((ts, num, flags))
 }
 
@@ -243,15 +246,14 @@ fn parse_extended_output_line(rest: &[u8]) -> Option<TmuxNotification> {
     let header = std::str::from_utf8(&rest[..colon_idx]).ok()?;
     let mut parts = header.split_whitespace();
     let pane = parts.next()?.parse::<TmuxPaneId>().ok()?;
-    let age_ms = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let age_ms = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     let payload = &rest[colon_idx + 3..];
     let mut data = Vec::with_capacity(payload.len());
     decode_tmux_output(payload, &mut data);
-    Some(TmuxNotification::ExtendedOutput {
-        pane,
-        age_ms,
-        data,
-    })
+    Some(TmuxNotification::ExtendedOutput { pane, age_ms, data })
 }
 
 fn parse_notification(line: &str) -> Option<TmuxNotification> {
@@ -268,13 +270,24 @@ fn parse_notification(line: &str) -> Option<TmuxNotification> {
         });
     }
     if let Some(arg) = line.strip_prefix("%window-add ") {
+        let mut parts = arg.split_whitespace();
         return Some(TmuxNotification::WindowAdd {
-            window: arg.trim().parse().ok()?,
+            window: parts.next()?.parse().ok()?,
         });
     }
-    if let Some(arg) = line.strip_prefix("%window-close ") {
+    if let Some(arg) = line
+        .strip_prefix("%window-close ")
+        .or_else(|| line.strip_prefix("%unlinked-window-close "))
+    {
+        let mut parts = arg.split_whitespace();
         return Some(TmuxNotification::WindowClose {
-            window: arg.trim().parse().ok()?,
+            window: parts.next()?.parse().ok()?,
+        });
+    }
+    if let Some(arg) = line.strip_prefix("%pane-exited ") {
+        let mut parts = arg.split_whitespace();
+        return Some(TmuxNotification::PaneExited {
+            pane: parts.next()?.parse().ok()?,
         });
     }
     if let Some(rest) = line.strip_prefix("%window-renamed ") {
@@ -390,6 +403,26 @@ mod tests {
             events[4],
             TmuxEvent::Notification(TmuxNotification::Exit {
                 reason: Some("detached".into())
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pane_exited_and_unlinked_close() {
+        let mut parser = ControlParser::new();
+        let stream = b"%pane-exited %3 0\n%unlinked-window-close @5\n";
+        let events = parser.feed(stream);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            TmuxEvent::Notification(TmuxNotification::PaneExited {
+                pane: TmuxPaneId(3)
+            })
+        );
+        assert_eq!(
+            events[1],
+            TmuxEvent::Notification(TmuxNotification::WindowClose {
+                window: TmuxWindowId(5)
             })
         );
     }

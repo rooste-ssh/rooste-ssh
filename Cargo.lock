@@ -4673,6 +4673,7 @@ dependencies = [
  "rooste-sftp",
  "rooste-terminal",
  "rooste-testkit",
+ "rooste-tmux",
  "russh",
  "serde",
  "serde_json",
@@ -4700,6 +4701,14 @@ dependencies = [
  "russh-sftp",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rooste-tmux"
+version = "0.5.1"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
