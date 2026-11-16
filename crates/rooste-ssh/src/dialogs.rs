@@ -120,6 +120,7 @@ impl ProfileEditor {
         let mut profile = self.profile.clone();
         profile.host = profile.host.trim().to_owned();
         profile.name = profile.name.trim().to_owned();
+        profile.tmux_session_name = profile.tmux_session_name.trim().to_owned();
         profile.folder = profile
             .folder
             .split('/')
@@ -288,7 +289,27 @@ impl ProfileEditor {
                                                 "Show the server's graphical programs here. \
                                                  Needs a local X server (on Windows e.g. VcXsrv).",
                                             );
+                                        ui.checkbox(
+                                            &mut p.tmux_auto_attach,
+                                            "Attach to tmux (-CC) on connect",
+                                        )
+                                        .on_hover_text(
+                                            "Run `tmux -CC new-session -A -s <session>` automatically \
+                                             so remote tmux windows and splits open as native tabs and panes.",
+                                        );
                                     });
+                                    if p.tmux_auto_attach {
+                                        labeled(ui, "tmux session", |ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut p.tmux_session_name,
+                                                )
+                                                .margin(crate::theme::FIELD_MARGIN)
+                                                .hint_text("main")
+                                                .desired_width(crate::theme::FIELD_WIDTH),
+                                            )
+                                        });
+                                    }
                                 }
                                 labeled(ui, "Run on connect", |ui| {
                                     let shown = if p.on_connect_script.is_empty() {
@@ -544,6 +565,10 @@ impl SettingsEditor {
                             ui.checkbox(
                                 &mut s.auto_reconnect,
                                 "Reconnect automatically when a connection drops",
+                            );
+                            ui.checkbox(
+                                &mut s.tmux_bury_gateway,
+                                "Hide tmux (-CC) gateway tab when panes open",
                             );
                             ui.checkbox(&mut s.check_updates, "Check for updates at startup");
                         });

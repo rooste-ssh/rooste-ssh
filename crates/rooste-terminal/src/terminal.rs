@@ -15,6 +15,7 @@ use crate::input::InputMode;
 use crate::palette::{Palette, Rgb};
 
 const DEFAULT_SCROLLBACK: usize = 10_000;
+const DCS_TMUX_ENTER: &[u8] = b"\x1bP1000p";
 
 /// Something the terminal wants the application to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,8 @@ pub enum TermEvent {
     Bell,
     /// OSC 52: the remote application put text on the clipboard.
     Clipboard(String),
+    /// `tmux -CC` emitted `\033P1000p` to enter control mode; carries any trailing bytes.
+    TmuxControlModeEntered(Vec<u8>),
 }
 
 /// Which mouse events the remote application asked for.
@@ -187,6 +190,10 @@ pub struct Terminal {
     listener: Listener,
     /// The last search match, where the next search continues from.
     found: Option<Match>,
+    /// Number of bytes matched in `\x1bP1000p` so far.
+    dcs_matched: usize,
+    /// True while this terminal is acting as a `tmux -CC` gateway.
+    in_tmux_control_mode: bool,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -194,6 +201,7 @@ impl std::fmt::Debug for Terminal {
         f.debug_struct("Terminal")
             .field("cols", &self.term.columns())
             .field("rows", &self.term.screen_lines())
+            .field("in_tmux_control_mode", &self.in_tmux_control_mode)
             .finish_non_exhaustive()
     }
 }
@@ -224,11 +232,47 @@ impl Terminal {
             parser: Processor::new(),
             listener,
             found: None,
+            dcs_matched: 0,
+            in_tmux_control_mode: false,
         }
+    }
+
+    /// Whether this terminal has entered `tmux -CC` control mode.
+    pub fn is_tmux_control_mode(&self) -> bool {
+        self.in_tmux_control_mode
+    }
+
+    /// Leave `tmux -CC` control mode and resume normal VT emulation.
+    pub fn exit_tmux_control_mode(&mut self) {
+        self.in_tmux_control_mode = false;
+        self.dcs_matched = 0;
     }
 
     /// Process output from the remote side.
     pub fn advance(&mut self, bytes: &[u8]) {
+        if !self.in_tmux_control_mode {
+            for (idx, &b) in bytes.iter().enumerate() {
+                if b == DCS_TMUX_ENTER[self.dcs_matched] {
+                    self.dcs_matched += 1;
+                    if self.dcs_matched == DCS_TMUX_ENTER.len() {
+                        self.dcs_matched = 0;
+                        self.in_tmux_control_mode = true;
+                        let prefix_end = (idx + 1).saturating_sub(DCS_TMUX_ENTER.len());
+                        if prefix_end > 0 {
+                            self.parser.advance(&mut self.term, &bytes[..prefix_end]);
+                            self.repair_cursor_cell();
+                        }
+                        self.listener
+                            .push(TermEvent::TmuxControlModeEntered(bytes[idx + 1..].to_vec()));
+                        return;
+                    }
+                } else if b == DCS_TMUX_ENTER[0] {
+                    self.dcs_matched = 1;
+                } else {
+                    self.dcs_matched = 0;
+                }
+            }
+        }
         self.parser.advance(&mut self.term, bytes);
         self.repair_cursor_cell();
     }

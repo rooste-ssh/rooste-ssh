@@ -1,0 +1,19 @@
+[package]
+name = "rooste-tmux"
+description = "Sans-I/O state machine and parser for the tmux control mode (tmux -CC) protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

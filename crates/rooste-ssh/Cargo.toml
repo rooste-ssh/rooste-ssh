@@ -30,6 +30,7 @@ rooste-keys.workspace = true
 rooste-protocols.workspace = true
 rooste-sftp.workspace = true
 rooste-terminal.workspace = true
+rooste-tmux.workspace = true
 rfd.workspace = true
 rhai.workspace = true
 serde.workspace = true

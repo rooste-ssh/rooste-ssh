@@ -34,6 +34,10 @@ pub struct Profile {
     pub forward_agent: bool,
     /// Show the server's graphical (X11) programs on the local display.
     pub forward_x11: bool,
+    /// Automatically attach or create a `tmux -CC` session after connecting.
+    pub tmux_auto_attach: bool,
+    /// Target tmux session name when `tmux_auto_attach` is enabled (defaults to `main` if empty).
+    pub tmux_session_name: String,
     /// A script (file name in the scripts folder) to run once connected;
     /// empty for none.
     pub on_connect_script: String,
@@ -210,6 +214,8 @@ impl Default for Profile {
             proxy_jump: None,
             forward_agent: false,
             forward_x11: false,
+            tmux_auto_attach: false,
+            tmux_session_name: String::new(),
             on_connect_script: String::new(),
             tunnels: Vec::new(),
             serial: SerialSettings::default(),
@@ -229,6 +235,24 @@ impl Profile {
         self.port
             .or_else(|| self.protocol.default_port())
             .unwrap_or(22)
+    }
+
+    /// Shell command sent after login when `tmux_auto_attach` is enabled.
+    pub fn tmux_attach_command(&self) -> Option<String> {
+        if !self.tmux_auto_attach || self.protocol != Protocol::Ssh {
+            return None;
+        }
+        let raw_name = self.tmux_session_name.trim();
+        let name: String = if raw_name.is_empty() {
+            "main".to_owned()
+        } else {
+            raw_name
+                .chars()
+                .filter(|c| c.is_alphanumeric() || "-_".contains(*c))
+                .collect()
+        };
+        let session = if name.is_empty() { "main" } else { &name };
+        Some(format!("tmux -CC new-session -A -s {session}\n"))
     }
 
     /// Name shown in lists: the profile name, or `user@host`.
@@ -384,5 +408,21 @@ mod tests {
         assert_eq!(copy.name, "Web server (copy)");
         assert!(!copy.save_password);
         assert_eq!(copy.host, p.host);
+    }
+
+    #[test]
+    fn tmux_attach_command_formatting() {
+        let mut p = sample();
+        assert_eq!(p.tmux_attach_command(), None);
+        p.tmux_auto_attach = true;
+        assert_eq!(
+            p.tmux_attach_command().as_deref(),
+            Some("tmux -CC new-session -A -s main\n")
+        );
+        p.tmux_session_name = "dev-work_1".into();
+        assert_eq!(
+            p.tmux_attach_command().as_deref(),
+            Some("tmux -CC new-session -A -s dev-work_1\n")
+        );
     }
 }
