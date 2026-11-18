@@ -13,6 +13,10 @@ ignore = [
     # challenge locally, once per connection; host-key checks are public-key only.
     # Dropping RSA would lock out many users. Revisit when `rsa` ships a fix.
     { id = "RUSTSEC-2023-0071", reason = "no fix available; local, low-volume signing only" },
+    # chrono is marked unmaintained, but there is no known vulnerability. We only
+    # format local timestamps with it, and russh-sftp depends on it anyway, so
+    # dropping our direct use would not remove it. Revisit when russh-sftp moves off.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vulnerability; also pulled in by russh-sftp" },
 ]
 
 [licenses]
