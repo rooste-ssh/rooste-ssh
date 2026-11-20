@@ -1,5 +1,6 @@
 //! One terminal tab: a session, its terminal and pending prompts.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,18 +8,23 @@ use egui::{RichText, Ui};
 use rooste_core::Settings;
 use rooste_protocols::ssh::UnknownHostKey;
 use rooste_terminal::{Palette, PlainText, SearchDirection, TermEvent, Terminal};
+use rooste_tmux::{
+    TmuxClientAction, TmuxNotification, TmuxPaneId, TmuxSessionId, TmuxWindowId, TmuxWindowSnapshot,
+};
 use tokio::sync::oneshot;
 
 use crate::files::FilesPanel;
 use crate::scripting::ScriptEvent;
 use crate::session::{
-    ConnectRequest, Failure, PromptKind, Session, SessionCommand, SessionEvent, TunnelStatus,
+    ConnectRequest, Failure, PromptKind, Session, SessionCommand, SessionEvent, SessionSender,
+    TunnelStatus,
 };
 use crate::terminal_view::TerminalView;
 use crate::theme;
 
 /// Reconnect attempts before giving up.
 const MAX_RECONNECTS: u32 = 10;
+const MAX_PROTOCOL_LOG_LINES: usize = 200;
 
 /// Connection state of a tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +38,34 @@ pub enum TabState {
     },
     Closed(Option<u32>),
     Failed(String),
+}
+
+/// Role of a tab in `tmux -CC` control mode integration.
+#[derive(Debug, Clone)]
+pub enum TmuxRole {
+    /// Standard 1:1 terminal session.
+    None,
+    /// The gateway tab hosting the `tmux -CC` control connection.
+    Gateway {
+        session_id: Option<TmuxSessionId>,
+        session_name: String,
+        protocol_log: VecDeque<String>,
+        show_log: bool,
+        custom_command: String,
+    },
+    /// A native pane mapped from a remote `tmux -CC` window and pane.
+    Pane {
+        gateway_tab_id: u64,
+        sender: SessionSender,
+        session_id: TmuxSessionId,
+        session_name: String,
+        window_id: TmuxWindowId,
+        pane_id: TmuxPaneId,
+        window_name: String,
+        cwd: String,
+        paused: bool,
+        remote_geom: (u16, u16),
+    },
 }
 
 /// A secret the session is waiting for.
@@ -55,8 +89,38 @@ pub enum TabAction {
     EnableLegacy { profile_id: Option<String> },
     /// The user chose this folder with "Download to…".
     RememberDownloadFolder(std::path::PathBuf),
-    /// Show a message in the status bar (from a script).
+    /// Show a message in the status bar (from a script or tmux mode).
     Notify { text: String, error: bool },
+    /// Gateway tab synced the full window/pane topology from `tmux -CC`.
+    TmuxTopologySynced {
+        gateway_tab_id: u64,
+        session_id: TmuxSessionId,
+        session_name: String,
+        windows: Vec<TmuxWindowSnapshot>,
+    },
+    /// Gateway tab received decoded VT output for a child tmux pane.
+    TmuxPaneOutput {
+        gateway_tab_id: u64,
+        pane_id: TmuxPaneId,
+        bytes: Vec<u8>,
+    },
+    /// Gateway tab received an incremental `tmux -CC` notification.
+    TmuxNotification {
+        gateway_tab_id: u64,
+        notification: TmuxNotification,
+    },
+    /// Gateway tab received updated pane title and working directory.
+    TmuxPaneMetadata {
+        gateway_tab_id: u64,
+        pane_id: TmuxPaneId,
+        title: String,
+        cwd: String,
+    },
+    /// Gateway tab exited `tmux -CC` control mode.
+    TmuxDetached {
+        gateway_tab_id: u64,
+        reason: Option<String>,
+    },
 }
 
 /// A script running in a tab.
@@ -138,6 +202,8 @@ pub struct FindBar {
     focus: bool,
 }
 
+static NEXT_TAB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct SessionTab {
     /// Unique and stable for the tab's lifetime (egui_tiles moves panes in
@@ -175,10 +241,12 @@ pub struct SessionTab {
     pub recording: Option<crate::recording::SessionRecording>,
     /// The SFTP side panel, when shown.
     pub files: Option<FilesPanel>,
+    /// Role in `tmux -CC` control mode integration.
+    pub tmux_role: TmuxRole,
     download_dir: std::path::PathBuf,
     /// The folder last chosen with "Download to…".
     recent_download_dir: Option<std::path::PathBuf>,
-    session: Session,
+    session: Option<Session>,
     host_key: Option<(UnknownHostKey, oneshot::Sender<bool>)>,
     /// Grid size the server was last told about.
     remote_size: (u16, u16),
@@ -198,12 +266,11 @@ impl SessionTab {
     ) -> Self {
         let mut view = TerminalView::default();
         theme::apply_to_view(&mut view, settings);
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let log_dir = settings.log_dir.trim();
         let log_path = (!log_dir.is_empty())
             .then(|| rooste_core::expand_tilde(log_dir).join(log_file_name(&name)));
         let mut tab = Self {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name,
             remote_title: None,
             state: TabState::Connecting("Connecting…".into()),
@@ -215,7 +282,7 @@ impl SessionTab {
             ),
             view,
             remote_size: (request.cols.max(1), request.rows.max(1)),
-            session: Self::spawn(runtime, ctx, request.clone()),
+            session: Some(Self::spawn(runtime, ctx, request.clone())),
             request,
             profile_id: None,
             save_password: false,
@@ -231,6 +298,7 @@ impl SessionTab {
             script: None,
             on_connect_script: None,
             files: None,
+            tmux_role: TmuxRole::None,
             download_dir: crate::theme::download_dir(settings),
             recent_download_dir: crate::theme::recent_download_dir(settings),
             host_key: None,
@@ -245,6 +313,83 @@ impl SessionTab {
         tab
     }
 
+    /// Create a native tab representing a remote `tmux -CC` pane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_tmux_pane(
+        runtime: &tokio::runtime::Handle,
+        ctx: &egui::Context,
+        gateway_tab_id: u64,
+        sender: SessionSender,
+        session_id: TmuxSessionId,
+        session_name: &str,
+        window_id: TmuxWindowId,
+        window_name: String,
+        pane_id: TmuxPaneId,
+        cols: u16,
+        rows: u16,
+        title: String,
+        cwd: String,
+        request: ConnectRequest,
+        profile_id: Option<String>,
+        settings: &Settings,
+    ) -> Self {
+        let mut view = TerminalView::default();
+        theme::apply_to_view(&mut view, settings);
+        const MAX_PANE_COLS: u16 = 1000;
+        const MAX_PANE_ROWS: u16 = 1000;
+        let (cols, rows) = (cols.clamp(1, MAX_PANE_COLS), rows.clamp(1, MAX_PANE_ROWS));
+        let display_name = format!("[tmux:{session_name}] {window_name} ({pane_id})");
+        Self {
+            id: NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: display_name,
+            remote_title: (!title.is_empty()).then_some(title),
+            state: TabState::Connected,
+            terminal: Terminal::with_options(
+                cols,
+                rows,
+                theme::palette(settings.theme),
+                settings.scrollback_lines,
+            ),
+            view,
+            remote_size: (cols, rows),
+            session: None,
+            request,
+            profile_id,
+            save_password: false,
+            tunnels: Vec::new(),
+            broadcast: false,
+            outbox: Vec::new(),
+            auto_reconnect: false,
+            failure: None,
+            prompt: None,
+            find: None,
+            log: None,
+            recording: None,
+            script: None,
+            on_connect_script: None,
+            files: None,
+            tmux_role: TmuxRole::Pane {
+                gateway_tab_id,
+                sender,
+                session_id,
+                session_name: session_name.to_owned(),
+                window_id,
+                pane_id,
+                window_name,
+                cwd,
+                paused: false,
+                remote_geom: (cols, rows),
+            },
+            download_dir: crate::theme::download_dir(settings),
+            recent_download_dir: crate::theme::recent_download_dir(settings),
+            host_key: None,
+            reconnects: 0,
+            runtime: runtime.clone(),
+            ctx: ctx.clone(),
+            actions: Vec::new(),
+        }
+    }
+
     fn spawn(
         runtime: &tokio::runtime::Handle,
         ctx: &egui::Context,
@@ -252,6 +397,48 @@ impl SessionTab {
     ) -> Session {
         let wake = ctx.clone();
         Session::spawn(runtime, request, move || wake.request_repaint())
+    }
+
+    /// Obtain a cloneable command sender if this tab owns a live session or is a tmux pane.
+    pub fn session_sender(&self) -> Option<SessionSender> {
+        if let Some(session) = &self.session {
+            return Some(session.sender());
+        }
+        if let TmuxRole::Pane { sender, .. } = &self.tmux_role {
+            return Some(sender.clone());
+        }
+        None
+    }
+
+    fn send_session(&self, command: SessionCommand) {
+        if let Some(session) = &self.session {
+            session.send(command);
+        } else if let TmuxRole::Pane { sender, .. } = &self.tmux_role {
+            sender.send(command);
+        }
+    }
+
+    /// Feed decoded `%output` bytes into a tmux pane tab.
+    pub fn receive_tmux_output(&mut self, bytes: &[u8]) {
+        self.terminal.advance(bytes);
+        if let Some(script) = &mut self.script {
+            let text = script.text.convert(bytes);
+            script.handle.output(&text);
+        }
+        if let Some(log) = &mut self.log
+            && let Err(e) = log.write(bytes)
+        {
+            let path = log.path.display().to_string();
+            self.log = None;
+            self.note(&format!("Stopped logging to {path}: {e}"));
+        }
+        if let Some(recording) = &mut self.recording
+            && let Err(e) = recording.output(bytes)
+        {
+            let path = recording.path.display().to_string();
+            self.recording = None;
+            self.note(&format!("Stopped recording to {path}: {e}"));
+        }
     }
 
     /// A new tab connecting to the same place.
@@ -274,7 +461,9 @@ impl SessionTab {
         let (cols, rows) = self.terminal.size();
         (self.request.cols, self.request.rows) = (cols, rows);
         self.remote_size = (cols, rows);
-        self.session = Self::spawn(&self.runtime, &self.ctx, self.request.clone());
+        self.tmux_role = TmuxRole::None;
+        self.terminal.exit_tmux_control_mode();
+        self.session = Some(Self::spawn(&self.runtime, &self.ctx, self.request.clone()));
         self.state = TabState::Connecting("Connecting…".into());
         self.failure = None;
         self.tunnels.clear();
@@ -394,7 +583,7 @@ impl SessionTab {
         if self.files.take().is_none() {
             self.files = Some(self.new_files_panel());
             if self.state == TabState::Connected {
-                self.session.send(SessionCommand::OpenFiles);
+                self.send_session(SessionCommand::OpenFiles);
             }
         }
     }
@@ -419,8 +608,12 @@ impl SessionTab {
         } else {
             ""
         };
+        let paused = match &self.tmux_role {
+            TmuxRole::Pane { paused: true, .. } => "⏸ ",
+            _ => "",
+        };
         format!(
-            "{marker}{legacy}{broadcast}{logging}{recording}{}",
+            "{marker}{legacy}{broadcast}{logging}{recording}{paused}{}",
             self.name
         )
     }
@@ -459,7 +652,9 @@ impl SessionTab {
         theme::apply_to_view(&mut self.view, settings);
         self.terminal.set_palette(theme::palette(settings.theme));
         self.terminal.set_scrollback(settings.scrollback_lines);
-        self.auto_reconnect = settings.auto_reconnect;
+        if !matches!(self.tmux_role, TmuxRole::Pane { .. }) {
+            self.auto_reconnect = settings.auto_reconnect;
+        }
         self.download_dir = crate::theme::download_dir(settings);
         self.recent_download_dir = crate::theme::recent_download_dir(settings);
         if let Some(files) = &mut self.files {
@@ -472,11 +667,26 @@ impl SessionTab {
         self.terminal.palette()
     }
 
-    /// Send input to the remote side (used for broadcasts).
+    /// Send input to the remote side (used for broadcasts and scripts).
     pub fn send_input(&mut self, bytes: Vec<u8>) {
         if self.state == TabState::Connected {
             self.terminal.scroll_to_bottom();
-            self.session.send(SessionCommand::Input(bytes));
+            match &self.tmux_role {
+                TmuxRole::Pane {
+                    sender, pane_id, ..
+                } => {
+                    sender.send(SessionCommand::TmuxPaneInput {
+                        pane_id: *pane_id,
+                        bytes,
+                    });
+                }
+                TmuxRole::Gateway { .. } => {
+                    // Gateway tabs in tmux control mode do not accept terminal keyboard input.
+                }
+                TmuxRole::None => {
+                    self.send_session(SessionCommand::Input(bytes));
+                }
+            }
         }
     }
 
@@ -513,13 +723,11 @@ impl SessionTab {
     fn poll_script(&mut self) {
         let Some(script) = &self.script else { return };
         let name = script.handle.name.clone();
-        for event in script.handle.events() {
+        let events = script.handle.events();
+        for event in events {
             match event {
                 ScriptEvent::Send(bytes) => {
-                    if self.state == TabState::Connected {
-                        self.terminal.scroll_to_bottom();
-                        self.session.send(SessionCommand::Input(bytes));
-                    }
+                    self.send_input(bytes);
                 }
                 ScriptEvent::Notify(text) => {
                     self.actions.push(TabAction::Notify { text, error: false });
@@ -616,10 +824,23 @@ impl SessionTab {
         self.failure = Some(failure);
     }
 
+    fn ensure_gateway_role(&mut self) {
+        if !matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
+            self.tmux_role = TmuxRole::Gateway {
+                session_id: None,
+                session_name: "tmux".to_owned(),
+                protocol_log: VecDeque::new(),
+                show_log: false,
+                custom_command: String::new(),
+            };
+        }
+    }
+
     /// Handle session and terminal events, and due reconnects.
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.poll_script();
-        for event in self.session.poll() {
+        let events = self.session.as_ref().map(Session::poll).unwrap_or_default();
+        for event in events {
             match event {
                 SessionEvent::Status(text) => self.state = TabState::Connecting(text),
                 SessionEvent::HostKey { key, reply } => self.host_key = Some((key, reply)),
@@ -651,10 +872,15 @@ impl SessionTab {
                         self.run_script(&path);
                     }
                     if self.files.is_some() {
-                        self.session.send(SessionCommand::OpenFiles);
+                        self.send_session(SessionCommand::OpenFiles);
                     }
                 }
-                SessionEvent::Files(handle) => {
+                SessionEvent::Files(mut handle) => {
+                    if let TmuxRole::Pane { cwd, .. } = &self.tmux_role
+                        && !cwd.is_empty()
+                    {
+                        handle.home = cwd.clone();
+                    }
                     if let Some(files) = &mut self.files {
                         files.attach(handle);
                     }
@@ -666,31 +892,107 @@ impl SessionTab {
                 }
                 SessionEvent::Tunnels(statuses) => self.tunnels = statuses,
                 SessionEvent::Output(bytes) => {
-                    self.terminal.advance(&bytes);
-                    if let Some(script) = &mut self.script {
-                        let text = script.text.convert(&bytes);
-                        script.handle.output(&text);
-                    }
-                    if let Some(log) = &mut self.log
-                        && let Err(e) = log.write(&bytes)
+                    self.receive_tmux_output(&bytes);
+                }
+                SessionEvent::TmuxTopologySynced {
+                    session_id,
+                    session_name,
+                    windows,
+                } => {
+                    self.ensure_gateway_role();
+                    if let TmuxRole::Gateway {
+                        session_id: sid,
+                        session_name: sname,
+                        ..
+                    } = &mut self.tmux_role
                     {
-                        let path = log.path.display().to_string();
-                        self.log = None;
-                        self.note(&format!("Stopped logging to {path}: {e}"));
+                        *sid = Some(session_id);
+                        *sname = session_name.clone();
                     }
-                    if let Some(recording) = &mut self.recording
-                        && let Err(e) = recording.output(&bytes)
+                    self.actions.push(TabAction::TmuxTopologySynced {
+                        gateway_tab_id: self.id,
+                        session_id,
+                        session_name,
+                        windows,
+                    });
+                }
+                SessionEvent::TmuxPaneOutput { pane_id, bytes } => {
+                    self.actions.push(TabAction::TmuxPaneOutput {
+                        gateway_tab_id: self.id,
+                        pane_id,
+                        bytes,
+                    });
+                }
+                SessionEvent::TmuxNotification(notification) => {
+                    self.ensure_gateway_role();
+                    if let TmuxNotification::SessionChanged { session, ref name } = notification
+                        && let TmuxRole::Gateway {
+                            session_id,
+                            session_name,
+                            ..
+                        } = &mut self.tmux_role
                     {
-                        let path = recording.path.display().to_string();
-                        self.recording = None;
-                        self.note(&format!("Stopped recording to {path}: {e}"));
+                        *session_id = Some(session);
+                        *session_name = name.clone();
                     }
+                    self.actions.push(TabAction::TmuxNotification {
+                        gateway_tab_id: self.id,
+                        notification,
+                    });
+                }
+                SessionEvent::TmuxPaneMetadata {
+                    pane_id,
+                    title,
+                    cwd,
+                } => {
+                    self.actions.push(TabAction::TmuxPaneMetadata {
+                        gateway_tab_id: self.id,
+                        pane_id,
+                        title,
+                        cwd,
+                    });
+                }
+                SessionEvent::TmuxProtocolLog(line) => {
+                    self.ensure_gateway_role();
+                    if let TmuxRole::Gateway { protocol_log, .. } = &mut self.tmux_role {
+                        if protocol_log.len() >= MAX_PROTOCOL_LOG_LINES {
+                            protocol_log.pop_front();
+                        }
+                        protocol_log.push_back(line);
+                    }
+                }
+                SessionEvent::TmuxDetached { reason } => {
+                    self.tmux_role = TmuxRole::None;
+                    self.terminal.exit_tmux_control_mode();
+                    self.note("[tmux control mode detached]");
+                    self.actions.push(TabAction::TmuxDetached {
+                        gateway_tab_id: self.id,
+                        reason,
+                    });
                 }
                 SessionEvent::Closed { exit_status } => {
                     self.prompt = None;
-                    self.state = TabState::Closed(exit_status)
+                    self.state = TabState::Closed(exit_status);
+                    if matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
+                        self.tmux_role = TmuxRole::None;
+                        self.terminal.exit_tmux_control_mode();
+                        self.actions.push(TabAction::TmuxDetached {
+                            gateway_tab_id: self.id,
+                            reason: Some("Connection closed".to_owned()),
+                        });
+                    }
                 }
-                SessionEvent::Failed(failure) => self.failed(failure),
+                SessionEvent::Failed(failure) => {
+                    self.failed(failure);
+                    if matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
+                        self.tmux_role = TmuxRole::None;
+                        self.terminal.exit_tmux_control_mode();
+                        self.actions.push(TabAction::TmuxDetached {
+                            gateway_tab_id: self.id,
+                            reason: Some("Connection failed".to_owned()),
+                        });
+                    }
+                }
             }
         }
         if let TabState::Reconnecting { at, .. } = self.state {
@@ -703,11 +1005,14 @@ impl SessionTab {
         }
         for event in self.terminal.take_events() {
             match event {
-                TermEvent::Reply(bytes) => self.session.send(SessionCommand::Input(bytes)),
+                TermEvent::Reply(bytes) => self.send_input(bytes),
                 TermEvent::Title(title) => self.remote_title = Some(title),
                 TermEvent::ResetTitle => self.remote_title = None,
                 TermEvent::Clipboard(text) => ctx.copy_text(text),
                 TermEvent::Bell => {}
+                TermEvent::TmuxControlModeEntered(_) => {
+                    self.ensure_gateway_role();
+                }
             }
         }
     }
@@ -736,7 +1041,153 @@ impl SessionTab {
     pub fn close(&mut self) {
         self.answer_host_key(false);
         self.answer_prompt(None);
-        self.session.send(SessionCommand::Close);
+        match &self.tmux_role {
+            TmuxRole::Pane {
+                sender, pane_id, ..
+            } => {
+                sender.send(SessionCommand::TmuxAction(TmuxClientAction::KillPane {
+                    pane: *pane_id,
+                }));
+            }
+            TmuxRole::Gateway { .. } => {
+                self.send_session(SessionCommand::ExitTmuxControlMode { force: false });
+                self.send_session(SessionCommand::Close);
+            }
+            TmuxRole::None => {
+                self.send_session(SessionCommand::Close);
+            }
+        }
+    }
+
+    /// Close the tab locally without sending remote kill or close commands.
+    pub fn close_locally(&mut self) {
+        self.answer_host_key(false);
+        self.answer_prompt(None);
+    }
+
+    fn tmux_gateway_ui(&mut self, ui: &mut Ui) {
+        let TmuxRole::Gateway {
+            session_name,
+            protocol_log,
+            show_log,
+            custom_command,
+            ..
+        } = &mut self.tmux_role
+        else {
+            return;
+        };
+        let mut detach = false;
+        let mut force_quit = false;
+        let mut new_win = false;
+        let mut run_cmd = None;
+
+        egui::Frame::NONE
+            .fill(ui.visuals().faint_bg_color)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("tmux -CC Gateway ({session_name})")).strong());
+                    if ui
+                        .button("Detach (Esc)")
+                        .on_hover_text("Detach cleanly and keep tmux running on the server")
+                        .clicked()
+                    {
+                        detach = true;
+                    }
+                    if ui
+                        .button("New tmux window")
+                        .on_hover_text("Create a new window in this tmux session")
+                        .clicked()
+                    {
+                        new_win = true;
+                    }
+                    if ui
+                        .button("Force exit (X)")
+                        .on_hover_text("Force exit tmux control mode and run stty sane")
+                        .clicked()
+                    {
+                        force_quit = true;
+                    }
+                    ui.checkbox(show_log, "Protocol log");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Command:");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(custom_command)
+                            .margin(crate::theme::FIELD_MARGIN)
+                            .hint_text("e.g. new-window -n logs")
+                            .desired_width(240.0),
+                    );
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button("Run").clicked() || enter) && !custom_command.trim().is_empty() {
+                        run_cmd = Some(std::mem::take(custom_command));
+                    }
+                });
+                if *show_log && !protocol_log.is_empty() {
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in protocol_log.iter() {
+                                ui.monospace(line);
+                            }
+                        });
+                }
+            });
+
+        if detach {
+            self.send_session(SessionCommand::ExitTmuxControlMode { force: false });
+        }
+        if force_quit {
+            self.send_session(SessionCommand::ExitTmuxControlMode { force: true });
+        }
+        if new_win {
+            self.send_session(SessionCommand::TmuxAction(TmuxClientAction::NewWindow {
+                cwd: None,
+            }));
+        }
+        if let Some(command) = run_cmd {
+            self.send_session(SessionCommand::TmuxAction(TmuxClientAction::RawCommand {
+                command,
+            }));
+        }
+    }
+
+    fn tmux_pane_banner_ui(&mut self, ui: &mut Ui) {
+        let TmuxRole::Pane {
+            sender,
+            pane_id,
+            paused,
+            ..
+        } = &mut self.tmux_role
+        else {
+            return;
+        };
+        if !*paused {
+            return;
+        }
+        let mut resume = false;
+        egui::Frame::NONE
+            .fill(ui.visuals().faint_bg_color)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "⏸ Output in this tmux pane was paused by flow control.",
+                    );
+                    if crate::theme::primary_button(ui, "Resume output").clicked() {
+                        resume = true;
+                    }
+                });
+            });
+        if resume {
+            *paused = false;
+            sender.send(SessionCommand::TmuxAction(TmuxClientAction::ContinuePane {
+                pane: *pane_id,
+            }));
+        }
     }
 
     /// Draw the tab: status and tunnel lines when needed, then the terminal.
@@ -812,6 +1263,8 @@ impl SessionTab {
                 }
             });
         }
+        self.tmux_gateway_ui(ui);
+        self.tmux_pane_banner_ui(ui);
         self.script_ui(ui);
         self.find_ui(ui);
         let panel_id = egui::Id::unique(("files", self.id));
@@ -832,8 +1285,24 @@ impl SessionTab {
             // Also catches resizes that happened while connecting.
             let size = self.terminal.size();
             if size != self.remote_size {
-                self.session.send(SessionCommand::Resize(size.0, size.1));
-                self.remote_size = size;
+                match &self.tmux_role {
+                    TmuxRole::Pane {
+                        sender, pane_id, ..
+                    } => {
+                        if !ui.input(|i| i.pointer.primary_down()) {
+                            sender.send(SessionCommand::TmuxResizePane {
+                                pane_id: *pane_id,
+                                cols: size.0,
+                                rows: size.1,
+                            });
+                            self.remote_size = size;
+                        }
+                    }
+                    _ => {
+                        self.send_session(SessionCommand::Resize(size.0, size.1));
+                        self.remote_size = size;
+                    }
+                }
                 if let Some(recording) = &mut self.recording
                     && recording.resize(size.0, size.1).is_err()
                 {
@@ -841,10 +1310,10 @@ impl SessionTab {
                 }
             }
             if !out.send.is_empty() {
-                if self.broadcast {
+                if self.broadcast && !matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
                     self.outbox.extend(out.send);
                 } else {
-                    self.session.send(SessionCommand::Input(out.send));
+                    self.send_input(out.send);
                 }
             }
         }

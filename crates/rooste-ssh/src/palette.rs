@@ -29,10 +29,23 @@ pub enum Command {
     CloseTab,
     RunScript(String),
     OpenScriptsFolder,
+    TmuxNewWindow,
+    TmuxDetach,
+    TmuxToggleSyncPanes,
 }
 
 /// Available commands with their labels.
 pub fn commands(profiles: &[Profile], has_tab: bool, scripts: &[String]) -> Vec<(String, Command)> {
+    commands_with_tmux(profiles, has_tab, false, scripts)
+}
+
+/// Available commands, including `tmux -CC` actions when a tmux session is active.
+pub fn commands_with_tmux(
+    profiles: &[Profile],
+    has_tab: bool,
+    has_tmux: bool,
+    scripts: &[String],
+) -> Vec<(String, Command)> {
     let mut list: Vec<(String, Command)> = profiles
         .iter()
         .map(|p| {
@@ -77,6 +90,19 @@ pub fn commands(profiles: &[Profile], has_tab: bool, scripts: &[String]) -> Vec<
                 Command::ToggleBroadcast,
             ),
             ("Close tab".to_owned(), Command::CloseTab),
+        ]);
+    }
+    if has_tmux {
+        list.extend([
+            ("tmux: New window".to_owned(), Command::TmuxNewWindow),
+            (
+                "tmux: Toggle synchronize panes".to_owned(),
+                Command::TmuxToggleSyncPanes,
+            ),
+            (
+                "tmux: Detach session (keep running remotely)".to_owned(),
+                Command::TmuxDetach,
+            ),
         ]);
     }
     if has_tab {

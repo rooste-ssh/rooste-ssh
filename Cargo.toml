@@ -17,6 +17,7 @@ authors = ["Martin Vooremäe"]
 rooste-core = { path = "crates/rooste-core", version = "=0.5.1" }
 rooste-protocols = { path = "crates/rooste-protocols", version = "=0.5.1" }
 rooste-terminal = { path = "crates/rooste-terminal", version = "=0.5.1" }
+rooste-tmux = { path = "crates/rooste-tmux", version = "=0.5.1" }
 rooste-keys = { path = "crates/rooste-keys", version = "=0.5.1" }
 rooste-sftp = { path = "crates/rooste-sftp", version = "=0.5.1" }
 # Test fixtures only; not published.

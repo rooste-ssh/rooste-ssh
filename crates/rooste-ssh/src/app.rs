@@ -1,5 +1,6 @@
 //! The application window: menu, session manager, tabs and dialogs.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,13 +9,17 @@ use egui_tiles::{Container, LinearDir, SimplificationOptions, Tile, TileId, Tree
 use rooste_core::import::{putty, ssh_config};
 use rooste_core::{Config, ConfigLocation, Profile, Protocol, SecretStore, Settings, Theme};
 use rooste_protocols::ssh::AgentSource;
+use rooste_tmux::{
+    LayoutNode, TmuxClientAction, TmuxNotification, TmuxPaneId, TmuxSessionId, TmuxWindowId,
+    TmuxWindowSnapshot,
+};
 
 use crate::dialogs::{self, Decision, ProfileEditor, SettingsEditor};
 use crate::manager::{self, ManagerAction, ManagerState};
 use crate::palette::{self as command_palette, Command};
 use crate::picker::{PickId, PickKind, Picker, path_row};
-use crate::session::ConnectRequest;
-use crate::tab::{SessionTab, TabAction};
+use crate::session::{ConnectRequest, SessionCommand};
+use crate::tab::{SessionTab, TabAction, TmuxRole};
 use crate::theme;
 use crate::tools::{AgentAction, AgentWindow, KeyConverter, KeyGenerator};
 
@@ -87,6 +92,9 @@ impl ConnectForm {
             tunnels: Vec::new(),
             protocol: Protocol::Ssh,
             serial: Default::default(),
+            tmux_command: None,
+            tmux_scrollback_capture: 1_000,
+            tmux_pause_after_secs: 5,
         })
     }
 }
@@ -145,6 +153,9 @@ enum TabMenuAction {
     StopScript,
     OpenScriptsFolder,
     Reconnect,
+    TmuxNewWindow,
+    TmuxDetach,
+    TmuxSyncPanes,
     Close,
 }
 
@@ -238,6 +249,169 @@ impl egui_tiles::Behavior<SessionTab> for TabBehavior {
         }
     }
 
+    fn tab_ui(
+        &mut self,
+        tiles: &mut egui_tiles::Tiles<SessionTab>,
+        ui: &mut Ui,
+        id: egui::Id,
+        tile_id: TileId,
+        state: &egui_tiles::TabState,
+    ) -> egui::Response {
+        let text = self.tab_title_for_tile(tiles, tile_id);
+        let close_btn_size = egui::Vec2::splat(self.close_button_outer_size());
+        let close_btn_left_padding = 4.0;
+        let font_id = egui::TextStyle::Button.resolve(ui.style());
+        let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
+
+        let x_margin = self.tab_title_spacing(ui.visuals());
+
+        let button_width = galley.size().x
+            + 2.0 * x_margin
+            + f32::from(state.closable) * (close_btn_left_padding + close_btn_size.x);
+        let (_, tab_rect) = ui.allocate_space(egui::vec2(button_width, ui.available_height()));
+
+        let draggable = self.is_tile_draggable(tiles, tile_id);
+        let sense = if draggable {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        };
+        let tab_response = ui.interact(tab_rect, id, sense);
+        let tab_response = if draggable {
+            tab_response.on_hover_cursor(self.tab_hover_cursor_icon())
+        } else {
+            tab_response
+        };
+
+        tab_response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::Role::Button,
+                ui.is_enabled(),
+                state.active,
+                galley.text(),
+            )
+        });
+
+        if ui.is_rect_visible(tab_rect) && !state.is_being_dragged {
+            let bg_color = self.tab_bg_color(ui.visuals(), tiles, tile_id, state);
+            let stroke = self.tab_outline_stroke(ui.visuals(), tiles, tile_id, state);
+            ui.painter().rect(
+                tab_rect.shrink(0.5),
+                0.0,
+                bg_color,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            if state.active {
+                ui.painter().hline(
+                    tab_rect.x_range(),
+                    tab_rect.bottom(),
+                    egui::Stroke::new(stroke.width + 1.0, bg_color),
+                );
+            }
+
+            let text_color = self.tab_text_color(ui.visuals(), tiles, tile_id, state);
+            let text_position = egui::Align2::LEFT_CENTER
+                .align_size_within_rect(galley.size(), tab_rect.shrink(x_margin))
+                .min;
+
+            ui.painter().galley(text_position, galley, text_color);
+
+            if state.closable {
+                let close_btn_rect = egui::Align2::RIGHT_CENTER
+                    .align_size_within_rect(close_btn_size, tab_rect.shrink(x_margin));
+
+                let close_btn_id = ui.auto_id_with("tab_close_btn");
+                let close_btn_response = ui
+                    .interact(close_btn_rect, close_btn_id, egui::Sense::click_and_drag())
+                    .on_hover_cursor(egui::CursorIcon::Default);
+
+                close_btn_response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Close")
+                });
+
+                let visuals = ui.style().interact(&close_btn_response);
+                let rect = close_btn_rect
+                    .shrink(self.close_button_inner_margin())
+                    .expand(visuals.expansion);
+                let stroke = visuals.fg_stroke;
+
+                ui.painter()
+                    .line_segment([rect.left_top(), rect.right_bottom()], stroke);
+                ui.painter()
+                    .line_segment([rect.right_top(), rect.left_bottom()], stroke);
+
+                if (close_btn_response.clicked()
+                    || tab_response.clicked_by(egui::PointerButton::Middle))
+                    && self.on_tab_close(tiles, tile_id)
+                {
+                    tiles.remove(tile_id);
+                }
+            }
+        }
+
+        let resp = self.on_tab_button(tiles, tile_id, tab_response);
+
+        // Beside the tmux gateway tab (main session), render an emoji "➕" tag to create a new tmux window.
+        let is_gateway = matches!(
+            tiles.get(tile_id),
+            Some(Tile::Pane(tab)) if matches!(tab.tmux_role, TmuxRole::Gateway { .. })
+        );
+        if is_gateway {
+            ui.add_space(2.0);
+            let plus_width = 28.0;
+            let (plus_rect, plus_response) = ui.allocate_exact_size(
+                egui::vec2(plus_width, ui.available_height()),
+                egui::Sense::click(),
+            );
+            if ui.is_rect_visible(plus_rect) {
+                let visuals = ui.visuals();
+                let hovered = plus_response.hovered();
+                let bg_color = if hovered {
+                    visuals.widgets.hovered.bg_fill
+                } else {
+                    self.tab_bar_color(visuals)
+                        .lerp_to_gamma(visuals.panel_fill, 0.5)
+                };
+                let stroke = if hovered {
+                    egui::Stroke::new(1.0, visuals.widgets.hovered.bg_stroke.color)
+                } else {
+                    egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color)
+                };
+                ui.painter().rect(
+                    plus_rect.shrink(0.5),
+                    0.0,
+                    bg_color,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+                let font_id = egui::TextStyle::Button.resolve(ui.style());
+                let text_color = if hovered {
+                    visuals.strong_text_color()
+                } else {
+                    visuals.text_color()
+                };
+                let plus_galley = ui
+                    .painter()
+                    .layout_no_wrap("➕".to_owned(), font_id, text_color);
+                let text_pos = egui::Align2::CENTER_CENTER
+                    .align_size_within_rect(plus_galley.size(), plus_rect)
+                    .min;
+                ui.painter().galley(text_pos, plus_galley, text_color);
+            }
+            let plus_response = plus_response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("New tmux window");
+            if plus_response.clicked() {
+                self.menu_actions
+                    .push((tile_id, TabMenuAction::TmuxNewWindow));
+            }
+        }
+
+        resp
+    }
+
     fn on_tab_button(
         &mut self,
         tiles: &mut egui_tiles::Tiles<SessionTab>,
@@ -258,8 +432,13 @@ impl egui_tiles::Behavior<SessionTab> for TabBehavior {
             && selected == tile_id
         {
             let visuals = &response.ctx.global_style().visuals;
+            let is_gateway = matches!(tab.tmux_role, TmuxRole::Gateway { .. });
             let accent = if focused {
-                visuals.hyperlink_color
+                if is_gateway {
+                    egui::Color32::from_rgb(245, 130, 32)
+                } else {
+                    visuals.hyperlink_color
+                }
             } else {
                 egui::Color32::from_gray(if visuals.dark_mode { 110 } else { 160 })
             };
@@ -282,6 +461,8 @@ impl egui_tiles::Behavior<SessionTab> for TabBehavior {
         let logging = tab.log.is_some();
         let recording = tab.recording.is_some();
         let running_script = tab.script.is_some();
+        let is_tmux = !matches!(tab.tmux_role, TmuxRole::None);
+        let is_tmux_pane = matches!(tab.tmux_role, TmuxRole::Pane { .. });
         let scripts_dir = self.scripts_dir.clone();
         response.context_menu(|ui| {
             let mut item = |ui: &mut Ui, label: &str, action: TabMenuAction| {
@@ -323,6 +504,14 @@ impl egui_tiles::Behavior<SessionTab> for TabBehavior {
                     ui.separator();
                     item(ui, "Open scripts folder", TabMenuAction::OpenScriptsFolder);
                 });
+            }
+            if is_tmux_pane {
+                ui.separator();
+                item(ui, "tmux: Synchronize panes", TabMenuAction::TmuxSyncPanes);
+            }
+            if is_tmux {
+                item(ui, "tmux: New window", TabMenuAction::TmuxNewWindow);
+                item(ui, "tmux: Detach session", TabMenuAction::TmuxDetach);
             }
             if ended {
                 item(ui, "Reconnect", TabMenuAction::Reconnect);
@@ -384,7 +573,7 @@ pub struct RoosteApp {
     applied_theme: Option<Theme>,
     /// Each tab group's selected tab in the last frame, to move the keyboard
     /// focus along when it changes.
-    selected_tabs: std::collections::HashMap<TileId, TileId>,
+    selected_tabs: HashMap<TileId, TileId>,
 }
 
 impl std::fmt::Debug for RoosteApp {
@@ -463,7 +652,7 @@ impl RoosteApp {
             imports: ImportSources::default(),
             window_title: String::new(),
             applied_theme: None,
-            selected_tabs: std::collections::HashMap::new(),
+            selected_tabs: HashMap::new(),
         }
     }
 
@@ -632,11 +821,54 @@ impl RoosteApp {
             .collect()
     }
 
+    fn tab(&self, id: TileId) -> Option<&SessionTab> {
+        match self.tree.tiles.get(id) {
+            Some(Tile::Pane(tab)) => Some(tab),
+            _ => None,
+        }
+    }
+
     fn tab_mut(&mut self, id: TileId) -> Option<&mut SessionTab> {
         match self.tree.tiles.get_mut(id) {
             Some(Tile::Pane(tab)) => Some(tab),
             _ => None,
         }
+    }
+
+    fn find_tile_by_tab_id(&self, tab_id: u64) -> Option<TileId> {
+        self.tree
+            .tiles
+            .iter()
+            .find_map(|(tile_id, tile)| match tile {
+                Tile::Pane(tab) if tab.id == tab_id => Some(*tile_id),
+                _ => None,
+            })
+    }
+
+    fn find_tmux_pane_tile(&self, gateway_tab_id: u64, pane_id: TmuxPaneId) -> Option<TileId> {
+        self.tree
+            .tiles
+            .iter()
+            .find_map(|(tile_id, tile)| match tile {
+                Tile::Pane(tab)
+                    if matches!(
+                        tab.tmux_role,
+                        TmuxRole::Pane {
+                            gateway_tab_id: gw,
+                            pane_id: pid,
+                            ..
+                        } if gw == gateway_tab_id && pid == pane_id
+                    ) =>
+                {
+                    Some(*tile_id)
+                }
+                _ => None,
+            })
+    }
+
+    fn has_active_tmux(&self) -> bool {
+        self.tabs()
+            .any(|tab| !matches!(tab.tmux_role, TmuxRole::None))
     }
 
     /// The first visible tab.
@@ -699,6 +931,9 @@ impl RoosteApp {
             tunnels: profile.tunnels.clone(),
             protocol: profile.protocol,
             serial: profile.serial,
+            tmux_command: profile.tmux_attach_command(),
+            tmux_scrollback_capture: self.config.settings.tmux_scrollback_capture,
+            tmux_pause_after_secs: self.config.settings.tmux_pause_after_secs,
         }
     }
 
@@ -729,6 +964,8 @@ impl RoosteApp {
         match self.quick.request() {
             Ok(mut request) => {
                 request.known_hosts = self.known_hosts.clone();
+                request.tmux_scrollback_capture = self.config.settings.tmux_scrollback_capture;
+                request.tmux_pause_after_secs = self.config.settings.tmux_pause_after_secs;
                 let name = format!("{}@{}", request.user, request.host);
                 let tab = SessionTab::open(
                     self.runtime.handle(),
@@ -754,7 +991,7 @@ impl RoosteApp {
     }
 
     /// Add a tab to the tab group of `beside` (or the root).
-    fn add_tab_beside(&mut self, mut tab: SessionTab, beside: Option<TileId>) {
+    fn add_tab_beside(&mut self, mut tab: SessionTab, beside: Option<TileId>) -> TileId {
         // A new tab takes the keyboard focus.
         tab.view.focus_requested = true;
         let id = self.tree.tiles.insert_pane(tab);
@@ -775,13 +1012,252 @@ impl RoosteApp {
                 self.tree.root = Some(tabs);
             }
         }
+        id
+    }
+
+    /// Reconcile a full `tmux -CC` topology snapshot into `egui_tiles::Tree<SessionTab>`.
+    fn sync_tmux_topology(
+        &mut self,
+        ctx: &egui::Context,
+        gateway_tab_id: u64,
+        session_id: TmuxSessionId,
+        session_name: String,
+        windows: Vec<TmuxWindowSnapshot>,
+    ) {
+        let Some(gateway_tile) = self.find_tile_by_tab_id(gateway_tab_id) else {
+            return;
+        };
+        let Some((sender, request, profile_id)) =
+            self.tree.tiles.get_pane(&gateway_tile).and_then(|gw| {
+                Some((
+                    gw.session_sender()?,
+                    gw.request.clone(),
+                    gw.profile_id.clone(),
+                ))
+            })
+        else {
+            return;
+        };
+
+        let settings = self.config.settings.clone();
+        let live_panes: Vec<TmuxPaneId> = windows
+            .iter()
+            .flat_map(|w| w.panes.iter().map(|p| p.pane_id))
+            .collect();
+        let dead_tiles: Vec<TileId> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(tile_id, tile)| match tile {
+                Tile::Pane(tab)
+                    if matches!(
+                        tab.tmux_role,
+                        TmuxRole::Pane {
+                            gateway_tab_id: gw,
+                            pane_id,
+                            ..
+                        } if gw == gateway_tab_id && !live_panes.contains(&pane_id)
+                    ) =>
+                {
+                    Some(*tile_id)
+                }
+                _ => None,
+            })
+            .collect();
+        for tile_id in dead_tiles {
+            self.remove_tab_locally(tile_id);
+        }
+
+        for win in windows {
+            for pane in &win.panes {
+                if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane.pane_id) {
+                    if let Some(tab) = self.tab_mut(tile_id) {
+                        tab.name =
+                            format!("[tmux:{}] {} ({})", session_name, win.name, pane.pane_id);
+                        if !pane.title.is_empty() {
+                            tab.remote_title = Some(pane.title.clone());
+                        }
+                        if let TmuxRole::Pane {
+                            window_id,
+                            window_name,
+                            session_name: s_name,
+                            sender: s_sender,
+                            cwd,
+                            remote_geom,
+                            ..
+                        } = &mut tab.tmux_role
+                        {
+                            *window_id = win.id;
+                            *window_name = win.name.clone();
+                            *s_name = session_name.clone();
+                            *s_sender = sender.clone();
+                            if !pane.cwd.is_empty() {
+                                *cwd = pane.cwd.clone();
+                            }
+                            *remote_geom = (pane.cols.clamp(1, 1000), pane.rows.clamp(1, 1000));
+                        }
+                    }
+                } else {
+                    let tab = SessionTab::open_tmux_pane(
+                        self.runtime.handle(),
+                        ctx,
+                        gateway_tab_id,
+                        sender.clone(),
+                        session_id,
+                        &session_name,
+                        win.id,
+                        win.name.clone(),
+                        pane.pane_id,
+                        pane.cols,
+                        pane.rows,
+                        pane.title.clone(),
+                        pane.cwd.clone(),
+                        request.clone(),
+                        profile_id.clone(),
+                        &settings,
+                    );
+                    self.add_tab_beside(tab, Some(gateway_tile));
+                }
+            }
+            if let Some(layout) = &win.layout {
+                self.apply_tmux_window_layout(gateway_tab_id, win.id, layout);
+            }
+        }
+    }
+
+    /// Reorganize split containers in `self.tree` when a tmux window has multiple split panes.
+    fn apply_tmux_window_layout(
+        &mut self,
+        gateway_tab_id: u64,
+        window_id: TmuxWindowId,
+        layout: &LayoutNode,
+    ) {
+        let panes = layout.panes();
+        let dead_tiles: Vec<TileId> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(tile_id, tile)| match tile {
+                Tile::Pane(tab)
+                    if matches!(
+                        tab.tmux_role,
+                        TmuxRole::Pane {
+                            gateway_tab_id: gw,
+                            window_id: wid,
+                            pane_id,
+                            ..
+                        } if gw == gateway_tab_id && wid == window_id && !panes.iter().any(|(p, _)| *p == pane_id)
+                    ) =>
+                {
+                    Some(*tile_id)
+                }
+                _ => None,
+            })
+            .collect();
+        for tile_id in dead_tiles {
+            self.remove_tab_locally(tile_id);
+        }
+
+        for (pane_id, geom) in &panes {
+            if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, *pane_id)
+                && let Some(tab) = self.tab_mut(tile_id)
+                && let TmuxRole::Pane { remote_geom, .. } = &mut tab.tmux_role
+            {
+                *remote_geom = (geom.cols.clamp(1, 1000), geom.rows.clamp(1, 1000));
+            }
+        }
+    }
+
+    fn handle_tmux_notification(&mut self, gateway_tab_id: u64, notification: TmuxNotification) {
+        match notification {
+            TmuxNotification::WindowClose { .. } => {
+                // tmux also sends this when a window is only unlinked from
+                // another session that shares it, so the tabs stay until the
+                // topology refresh the machine queued shows the window is gone.
+            }
+            TmuxNotification::PaneExited { pane } => {
+                if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane) {
+                    self.remove_tab_locally(tile_id);
+                }
+            }
+            TmuxNotification::WindowRenamed { window, name } => {
+                let ids = self.tab_ids();
+                for tile_id in ids {
+                    if let Some(tab) = self.tab_mut(tile_id)
+                        && let TmuxRole::Pane {
+                            gateway_tab_id: gw,
+                            window_id: wid,
+                            pane_id,
+                            window_name,
+                            session_name,
+                            ..
+                        } = &mut tab.tmux_role
+                        && *gw == gateway_tab_id
+                        && *wid == window
+                    {
+                        *window_name = name.clone();
+                        tab.name = format!("[tmux:{session_name}] {} ({})", name, pane_id);
+                    }
+                }
+            }
+            TmuxNotification::LayoutChange { window, layout, .. } => {
+                self.apply_tmux_window_layout(gateway_tab_id, window, &layout);
+            }
+            TmuxNotification::Pause { pane } => {
+                if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane)
+                    && let Some(tab) = self.tab_mut(tile_id)
+                    && let TmuxRole::Pane { paused, .. } = &mut tab.tmux_role
+                {
+                    *paused = true;
+                }
+            }
+            TmuxNotification::Continue { pane } => {
+                if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane)
+                    && let Some(tab) = self.tab_mut(tile_id)
+                    && let TmuxRole::Pane { paused, .. } = &mut tab.tmux_role
+                {
+                    *paused = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tmux_detached(&mut self, gateway_tab_id: u64, reason: Option<String>) {
+        let to_remove: Vec<TileId> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(tile_id, tile)| match tile {
+                Tile::Pane(tab)
+                    if matches!(
+                        tab.tmux_role,
+                        TmuxRole::Pane {
+                            gateway_tab_id: gw,
+                            ..
+                        } if gw == gateway_tab_id
+                    ) =>
+                {
+                    Some(*tile_id)
+                }
+                _ => None,
+            })
+            .collect();
+        for tile_id in to_remove {
+            self.remove_tab_locally(tile_id);
+        }
+        let msg = match reason {
+            Some(r) if !r.is_empty() => format!("Detached from tmux session ({r})."),
+            _ => "Detached from tmux session.".to_owned(),
+        };
+        self.notify(msg, false);
     }
 
     /// When a tab group switches to another tab (egui_tiles does that on
     /// mouse press, before a click), the new tab takes the keyboard focus if
     /// the old one had it.
     fn follow_tab_switches(&mut self) {
-        let selected: std::collections::HashMap<TileId, TileId> = self
+        let selected: HashMap<TileId, TileId> = self
             .tree
             .tiles
             .iter()
@@ -815,11 +1291,25 @@ impl RoosteApp {
         }
     }
 
+    fn remove_tab_locally(&mut self, id: TileId) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.close_locally();
+        }
+        self.tree.remove_recursively(id);
+    }
+
     fn close_tab(&mut self, id: TileId) {
+        let gateway_to_clean =
+            self.tree.tiles.get_pane(&id).and_then(|tab| {
+                matches!(tab.tmux_role, TmuxRole::Gateway { .. }).then_some(tab.id)
+            });
         if let Some(tab) = self.tab_mut(id) {
             tab.close();
         }
         self.tree.remove_recursively(id);
+        if let Some(gw_id) = gateway_to_clean {
+            self.handle_tmux_detached(gw_id, None);
+        }
     }
 
     /// The agent offered to sessions.
@@ -897,8 +1387,16 @@ impl RoosteApp {
         }
     }
 
-    /// A new tab connecting like `id`, in the same tab group.
+    /// A new tab connecting like `id`, in the same tab group (or a new tmux window).
     fn duplicate_tab(&mut self, id: TileId) {
+        if let Some(Tile::Pane(tab)) = self.tree.tiles.get(id)
+            && let TmuxRole::Pane { sender, cwd, .. } = &tab.tmux_role
+        {
+            sender.send(SessionCommand::TmuxAction(TmuxClientAction::NewWindow {
+                cwd: (!cwd.is_empty()).then(|| cwd.clone()),
+            }));
+            return;
+        }
         let settings = self.config.settings.clone();
         if let Some(tab) = self
             .tree
@@ -917,8 +1415,31 @@ impl RoosteApp {
         }
     }
 
-    /// Open a copy of tab `active` beside its tab group.
+    /// Open a copy of tab `active` beside its tab group (or split the remote tmux pane).
     fn split_tab(&mut self, active: TileId, dir: LinearDir) {
+        if let Some(Tile::Pane(tab)) = self.tree.tiles.get(active)
+            && let TmuxRole::Pane {
+                sender,
+                pane_id,
+                cwd,
+                ..
+            } = &tab.tmux_role
+        {
+            let cwd_opt = (!cwd.is_empty()).then(|| cwd.clone());
+            let action = match dir {
+                LinearDir::Horizontal => TmuxClientAction::SplitHorizontal {
+                    pane: *pane_id,
+                    cwd: cwd_opt,
+                },
+                LinearDir::Vertical => TmuxClientAction::SplitVertical {
+                    pane: *pane_id,
+                    cwd: cwd_opt,
+                },
+            };
+            sender.send(SessionCommand::TmuxAction(action));
+            return;
+        }
+
         let settings = self.config.settings.clone();
         let Some(mut tab) = self
             .tree
@@ -978,6 +1499,42 @@ impl RoosteApp {
             TabMenuAction::Reconnect => {
                 if let Some(tab) = self.tab_mut(id) {
                     tab.reconnect();
+                }
+            }
+            TabMenuAction::TmuxNewWindow => {
+                let sender = self.tab(id).and_then(|tab| tab.session_sender());
+                if let Some(sender) = sender {
+                    let cwd = self.tab(id).and_then(|tab| match &tab.tmux_role {
+                        TmuxRole::Pane { cwd, .. } if !cwd.is_empty() => Some(cwd.clone()),
+                        _ => None,
+                    });
+                    sender.send(SessionCommand::TmuxAction(TmuxClientAction::NewWindow {
+                        cwd,
+                    }));
+                }
+            }
+            TabMenuAction::TmuxDetach => {
+                if let Some(tab) = self.tab_mut(id)
+                    && let Some(sender) = tab.session_sender()
+                {
+                    sender.send(SessionCommand::ExitTmuxControlMode { force: false });
+                }
+            }
+            TabMenuAction::TmuxSyncPanes => {
+                let sync_target = self.tab(id).and_then(|tab| match &tab.tmux_role {
+                    TmuxRole::Pane {
+                        sender, window_id, ..
+                    } => Some((sender.clone(), *window_id)),
+                    _ => None,
+                });
+                if let Some((sender, window_id)) = sync_target {
+                    sender.send(SessionCommand::TmuxAction(
+                        TmuxClientAction::ToggleSyncPanes { window: window_id },
+                    ));
+                    self.notify(
+                        format!("Toggled synchronize-panes on tmux window {window_id}."),
+                        false,
+                    );
                 }
             }
             TabMenuAction::Close => self.request_close(id),
@@ -1137,6 +1694,30 @@ impl RoosteApp {
                     }
                 }
             }
+            Command::TmuxNewWindow => {
+                if let Some(id) = self.active_tab_id()
+                    && let Some(tab) = self.tab_mut(id)
+                    && let Some(sender) = tab.session_sender()
+                {
+                    let cwd = match &tab.tmux_role {
+                        TmuxRole::Pane { cwd, .. } if !cwd.is_empty() => Some(cwd.clone()),
+                        _ => None,
+                    };
+                    sender.send(SessionCommand::TmuxAction(TmuxClientAction::NewWindow {
+                        cwd,
+                    }));
+                }
+            }
+            Command::TmuxDetach => {
+                if let Some(id) = self.active_tab_id() {
+                    self.tab_menu_action(id, TabMenuAction::TmuxDetach);
+                }
+            }
+            Command::TmuxToggleSyncPanes => {
+                if let Some(id) = self.active_tab_id() {
+                    self.tab_menu_action(id, TabMenuAction::TmuxSyncPanes);
+                }
+            }
             Command::CloseTab => {
                 if let Some(id) = self.active_tab_id() {
                     self.request_close(id);
@@ -1294,6 +1875,62 @@ impl RoosteApp {
                             self.notify(e, true);
                         }
                     }
+                    TabAction::TmuxTopologySynced {
+                        gateway_tab_id,
+                        session_id,
+                        session_name,
+                        windows,
+                    } => {
+                        self.sync_tmux_topology(
+                            &ctx,
+                            gateway_tab_id,
+                            session_id,
+                            session_name,
+                            windows,
+                        );
+                    }
+                    TabAction::TmuxPaneOutput {
+                        gateway_tab_id,
+                        pane_id,
+                        bytes,
+                    } => {
+                        if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane_id)
+                            && let Some(tab) = self.tab_mut(tile_id)
+                        {
+                            tab.receive_tmux_output(&bytes);
+                        }
+                    }
+                    TabAction::TmuxNotification {
+                        gateway_tab_id,
+                        notification,
+                    } => {
+                        self.handle_tmux_notification(gateway_tab_id, notification);
+                    }
+                    TabAction::TmuxPaneMetadata {
+                        gateway_tab_id,
+                        pane_id,
+                        title,
+                        cwd,
+                    } => {
+                        if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane_id)
+                            && let Some(tab) = self.tab_mut(tile_id)
+                        {
+                            if !title.is_empty() {
+                                tab.remote_title = Some(title);
+                            }
+                            if let TmuxRole::Pane { cwd: pane_cwd, .. } = &mut tab.tmux_role
+                                && !cwd.is_empty()
+                            {
+                                *pane_cwd = cwd;
+                            }
+                        }
+                    }
+                    TabAction::TmuxDetached {
+                        gateway_tab_id,
+                        reason,
+                    } => {
+                        self.handle_tmux_detached(gateway_tab_id, reason);
+                    }
                 }
             }
         }
@@ -1332,7 +1969,9 @@ impl RoosteApp {
                     let broadcast = self.broadcast;
                     for (_, tile) in self.tree.tiles.iter_mut() {
                         if let Tile::Pane(tab) = tile {
-                            tab.broadcast = broadcast && tab.state == TabState::Connected;
+                            let is_tmux_gw = matches!(tab.tmux_role, TmuxRole::Gateway { .. });
+                            tab.broadcast =
+                                broadcast && tab.state == TabState::Connected && !is_tmux_gw;
                         }
                     }
                     crate::terminal_view::set_focus_pending(
@@ -1361,14 +2000,20 @@ impl RoosteApp {
         let mut input = Vec::new();
         for (_, tile) in self.tree.tiles.iter_mut() {
             if let Tile::Pane(tab) = tile {
-                input.append(&mut tab.outbox);
+                if !matches!(tab.tmux_role, TmuxRole::Gateway { .. }) {
+                    input.append(&mut tab.outbox);
+                } else {
+                    tab.outbox.clear();
+                }
             }
         }
         if input.is_empty() {
             return;
         }
         for (_, tile) in self.tree.tiles.iter_mut() {
-            if let Tile::Pane(tab) = tile {
+            if let Tile::Pane(tab) = tile
+                && !matches!(tab.tmux_role, TmuxRole::Gateway { .. })
+            {
                 tab.send_input(input.clone());
             }
         }
@@ -1466,6 +2111,21 @@ impl RoosteApp {
                         self.broadcast = !self.broadcast;
                         self.toggle_broadcast();
                         ui.close();
+                    }
+                    if self.has_active_tmux() {
+                        ui.separator();
+                        if ui.button("tmux: New window").clicked() {
+                            self.run_command(&ctx, Command::TmuxNewWindow);
+                            ui.close();
+                        }
+                        if ui.button("tmux: Synchronize panes").clicked() {
+                            self.run_command(&ctx, Command::TmuxToggleSyncPanes);
+                            ui.close();
+                        }
+                        if ui.button("tmux: Detach session").clicked() {
+                            self.run_command(&ctx, Command::TmuxDetach);
+                            ui.close();
+                        }
                     }
                     ui.separator();
                     if ui
@@ -1665,6 +2325,7 @@ impl RoosteApp {
             }
         }
 
+        let has_tmux = self.has_active_tmux();
         let Some(mut dialog) = self.dialog.take() else {
             return;
         };
@@ -1751,9 +2412,10 @@ impl RoosteApp {
                     .scripts_dir()
                     .map(|dir| crate::scripting::list_scripts(&dir))
                     .unwrap_or_default();
-                let commands = command_palette::commands(
+                let commands = command_palette::commands_with_tmux(
                     &self.config.profiles,
                     self.active_tab_id().is_some(),
+                    has_tmux,
                     &scripts,
                 );
                 match command_palette::show(ctx, query, &commands) {

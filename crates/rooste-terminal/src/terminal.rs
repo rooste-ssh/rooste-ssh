@@ -26,6 +26,8 @@ pub enum TermEvent {
     Bell,
     /// OSC 52: the remote application put text on the clipboard.
     Clipboard(String),
+    /// `tmux -CC` emitted `\033P1000p` to enter control mode; carries any trailing bytes.
+    TmuxControlModeEntered(Vec<u8>),
 }
 
 /// Which mouse events the remote application asked for.
@@ -187,6 +189,10 @@ pub struct Terminal {
     listener: Listener,
     /// The last search match, where the next search continues from.
     found: Option<Match>,
+    /// Streaming detector for `\x1bP1000p`.
+    dcs: rooste_tmux::DcsDetector,
+    /// True while this terminal is acting as a `tmux -CC` gateway.
+    in_tmux_control_mode: bool,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -194,6 +200,7 @@ impl std::fmt::Debug for Terminal {
         f.debug_struct("Terminal")
             .field("cols", &self.term.columns())
             .field("rows", &self.term.screen_lines())
+            .field("in_tmux_control_mode", &self.in_tmux_control_mode)
             .finish_non_exhaustive()
     }
 }
@@ -224,11 +231,36 @@ impl Terminal {
             parser: Processor::new(),
             listener,
             found: None,
+            dcs: rooste_tmux::DcsDetector::new(),
+            in_tmux_control_mode: false,
         }
+    }
+
+    /// Whether this terminal has entered `tmux -CC` control mode.
+    pub fn is_tmux_control_mode(&self) -> bool {
+        self.in_tmux_control_mode
+    }
+
+    /// Leave `tmux -CC` control mode and resume normal VT emulation.
+    pub fn exit_tmux_control_mode(&mut self) {
+        self.in_tmux_control_mode = false;
+        self.dcs.reset();
     }
 
     /// Process output from the remote side.
     pub fn advance(&mut self, bytes: &[u8]) {
+        if !self.in_tmux_control_mode
+            && let Some((before, after)) = self.dcs.scan(bytes)
+        {
+            self.in_tmux_control_mode = true;
+            if !before.is_empty() {
+                self.parser.advance(&mut self.term, before);
+                self.repair_cursor_cell();
+            }
+            self.listener
+                .push(TermEvent::TmuxControlModeEntered(after.to_vec()));
+            return;
+        }
         self.parser.advance(&mut self.term, bytes);
         self.repair_cursor_cell();
     }
