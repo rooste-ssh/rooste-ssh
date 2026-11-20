@@ -15,6 +15,30 @@ use crate::unescape::escape_tmux_arg;
 /// could ever contain it, and `splitn` keeps that field whole.
 const FIELD_SEP: &str = "|~|";
 
+/// A random number from the standard library's randomly keyed hasher, which
+/// is plenty to keep markers unguessable without a dependency.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Undo tmux's `#{q:…}` quoting, which puts a backslash before special
+/// characters. The path is quoted so that a `|~|` in it can't be mistaken for
+/// [`FIELD_SEP`]: every `|` in it arrives as `\|`.
+fn unquote(quoted: &str) -> String {
+    let mut out = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Snapshot of a remote tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxPaneSnapshot {
@@ -187,6 +211,8 @@ pub struct TmuxMachine {
     ready: bool,
     /// Counter that makes each [`PendingCmd::UserCommandsUntil`] marker unique.
     next_marker: u64,
+    /// Random part of the markers, so a typed command can't print one.
+    marker_nonce: u64,
 }
 
 impl TmuxMachine {
@@ -228,6 +254,7 @@ impl TmuxMachine {
             client_size: (client_cols.max(20), client_rows.max(5)),
             ready: false,
             next_marker: 0,
+            marker_nonce: random_u64(),
         }
     }
 
@@ -244,7 +271,10 @@ impl TmuxMachine {
             return cmd;
         }
         self.next_marker += 1;
-        let marker = format!("rooste-sync-{}", self.next_marker);
+        let marker = format!(
+            "rooste-sync-{:016x}-{}",
+            self.marker_nonce, self.next_marker
+        );
         let text = format!("{cmd}display-message -p {marker}\n");
         self.pending
             .push_back(PendingCmd::UserCommandsUntil { marker });
@@ -280,7 +310,7 @@ impl TmuxMachine {
         );
         self.queue_command(
             PendingCmd::SubscribeFormats,
-            "refresh-client -B \"rooste_meta:%*:#{pane_current_path}|~|#{pane_title}\"\n",
+            "refresh-client -B \"rooste_meta:%*:#{q:pane_current_path}|~|#{pane_title}\"\n",
             out,
         );
         self.queue_sync_topology(out, true);
@@ -300,7 +330,7 @@ impl TmuxMachine {
         );
         self.queue_command(
             PendingCmd::ListPanes { finalize_attach },
-            "list-panes -s -F \"#{window_id}|~|#{pane_id}|~|#{pane_active}|~|#{pane_width}|~|#{pane_height}|~|#{pane_current_path}|~|#{pane_title}\"\n",
+            "list-panes -s -F \"#{window_id}|~|#{pane_id}|~|#{pane_active}|~|#{pane_width}|~|#{pane_height}|~|#{q:pane_current_path}|~|#{pane_title}\"\n",
             out,
         );
     }
@@ -424,7 +454,7 @@ impl TmuxMachine {
                         .next()
                         .and_then(|s| s.parse::<u16>().ok())
                         .unwrap_or(24);
-                    let cwd = parts.next().unwrap_or_default().to_owned();
+                    let cwd = unquote(parts.next().unwrap_or_default());
                     let title = parts.next().unwrap_or_default().to_owned();
 
                     let snap = TmuxPaneSnapshot {
@@ -578,7 +608,7 @@ impl TmuxMachine {
             } => {
                 let (cwd, title) = value
                     .split_once(FIELD_SEP)
-                    .map(|(c, t)| (c.to_owned(), t.to_owned()))
+                    .map(|(c, t)| (unquote(c), t.to_owned()))
                     .unwrap_or_else(|| (String::new(), value.clone()));
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     pane.title = title.clone();
@@ -797,7 +827,7 @@ mod tests {
               @0|~|1|~|b25f,120x40,0,0,0|~|my window|~|odd\n\
               %end 1 5 1\n\
               %begin 1 6 1\n\
-              @0|~|%0|~|1|~|120|~|40|~|/home/a b|~|vim: a|~|b.txt\n\
+              @0|~|%0|~|1|~|120|~|40|~|/home/a\\|~\\|b\\ c|~|vim: a|~|b.txt\n\
               %end 1 6 1\n",
         );
         let windows = events
@@ -808,7 +838,8 @@ mod tests {
             })
             .expect("topology");
         assert_eq!(windows[0].name, "my window|~|odd");
-        assert_eq!(windows[0].panes[0].cwd, "/home/a b");
+        // tmux 3.5a's `#{q:…}` output for the directory `/home/a|~|b c`.
+        assert_eq!(windows[0].panes[0].cwd, "/home/a|~|b c");
         assert_eq!(windows[0].panes[0].title, "vim: a|~|b.txt");
     }
 
@@ -827,25 +858,43 @@ mod tests {
         let sent = machine.queue_raw_command(
             r#"display -p "a;b" ; if-shell true { display -p x ; display -p y }"#,
         );
+        let (command, marker_cmd) = sent.split_once('\n').expect("two lines");
         assert_eq!(
-            sent,
-            "display -p \"a;b\" ; if-shell true { display -p x ; display -p y }\n\
-             display-message -p rooste-sync-1\n"
+            command,
+            r#"display -p "a;b" ; if-shell true { display -p x ; display -p y }"#
         );
+        let marker = marker_cmd
+            .strip_prefix("display-message -p ")
+            .and_then(|m| m.strip_suffix('\n'))
+            .expect("marker command");
+        assert!(marker.starts_with("rooste-sync-") && marker.len() > "rooste-sync-1".len());
         machine.queue_sync_topology(&mut String::new(), false);
-        // tmux 3.5a: one block each for display, if-shell, x and y, then the marker.
+        // tmux 3.5a: one block each for display, if-shell, x and y, then the
+        // marker. A line that only looks like a marker must not end the run.
         let events = machine.feed(
-            b"%begin 1 7 1\na;b\n%end 1 7 1\n\
-              %begin 1 8 1\n%end 1 8 1\n\
-              %begin 1 9 1\nx\n%end 1 9 1\n\
-              %begin 1 10 1\ny\n%end 1 10 1\n\
-              %begin 1 11 1\nrooste-sync-1\n%end 1 11 1\n\
-              %begin 1 12 1\n@0|~|1|~|b25f,120x40,0,0,0|~|dev\n%end 1 12 1\n\
-              %begin 1 13 1\n@0|~|%0|~|1|~|120|~|40|~|/home|~|sh\n%end 1 13 1\n",
+            format!(
+                "%begin 1 7 1\na;b\n%end 1 7 1\n\
+                 %begin 1 8 1\n%end 1 8 1\n\
+                 %begin 1 9 1\nrooste-sync-1\n%end 1 9 1\n\
+                 %begin 1 10 1\ny\n%end 1 10 1\n\
+                 %begin 1 11 1\n{marker}\n%end 1 11 1\n\
+                 %begin 1 12 1\n@0|~|1|~|b25f,120x40,0,0,0|~|dev\n%end 1 12 1\n\
+                 %begin 1 13 1\n@0|~|%0|~|1|~|120|~|40|~|/home|~|sh\n%end 1 13 1\n"
+            )
+            .as_bytes(),
         );
         assert!(events.iter().any(|e| matches!(
             e,
             MachineEvent::TopologySynced { windows, .. } if windows.len() == 1 && windows[0].name == "dev"
         )));
+    }
+
+    #[test]
+    fn markers_differ_between_connections() {
+        let marker = |m: &mut TmuxMachine| m.queue_raw_command("list-sessions");
+        assert_ne!(
+            marker(&mut TmuxMachine::new(80, 24, 0, 5)),
+            marker(&mut TmuxMachine::new(80, 24, 0, 5))
+        );
     }
 }
