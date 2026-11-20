@@ -4,6 +4,20 @@ All notable changes are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-20
+
+### Added
+
+- tmux integration: run `tmux -CC` (or `tmux -CC attach`) on a server, and its windows open as
+  tabs and its split panes as splits, all running on the server. Turn on "Attach to tmux (-CC) on
+  connect" in a session's settings to start it automatically. The tmux tab (marked in orange)
+  detaches, opens new windows and runs tmux commands; detaching leaves everything running on
+  the server for next time. Contributed by @alexleft.
+
+### Changed
+
+- Updated dependencies, including `rfd` 0.18 for the file dialogs.
+
 ## [0.5.1] - 2026-11-05
 
 ### Fixed
@@ -148,6 +162,7 @@ The first release.
 - Windows MSI installer and portable zip; Linux `.deb`, `.rpm`, AppImage, `.tar.gz` and Flatpak.
 - Optional check for new releases at startup.
 
+[0.6.0]: https://github.com/rooste-ssh/rooste-ssh/releases/tag/v0.6.0
 [0.5.1]: https://github.com/rooste-ssh/rooste-ssh/releases/tag/v0.5.1
 [0.5.0]: https://github.com/rooste-ssh/rooste-ssh/releases/tag/v0.5.0
 [0.4.0]: https://github.com/rooste-ssh/rooste-ssh/releases/tag/v0.4.0
