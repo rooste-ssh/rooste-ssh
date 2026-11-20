@@ -17,6 +17,8 @@ session manager, an SFTP file panel, port forwarding, and built-in key tools and
   with one-time codes. Unknown host keys are confirmed and saved to `~/.ssh/known_hosts`.
 - **Forwarding:** local, remote and dynamic (SOCKS) port forwarding with saved tunnels, jump
   hosts (`ProxyJump`), and agent and X11 forwarding.
+- **tmux:** with `tmux -CC`, the server's tmux windows and panes show up as tabs and split panes,
+  and keep running on the server when you disconnect.
 - **Files:** an SFTP panel next to the terminal. Browse, download or upload files and whole
   folders, drop files onto it to upload, or choose a folder with "Download to…".
 - **Terminal:** true color, Unicode, mouse support, search through the scrollback, per-tab zoom,
@@ -115,6 +117,13 @@ Turn on **Forward X11** in a session to show the server's graphical programs on 
 Linux desktops work as they are. On Windows, run an X server such as VcXsrv or X410 first; on
 macOS, XQuartz. The
 server only ever receives a random cookie, never your display's real one.
+
+### tmux
+
+Run `tmux -CC` on the server (or `tmux -CC attach` to get back to a running session), or turn on
+**Attach to tmux (-CC) on connect** in a session. Each tmux window opens as a tab and each pane as
+a split. The tmux tab, marked in orange, opens new windows, runs tmux commands and detaches;
+everything keeps running on the server until you attach again.
 
 ### Command line
 

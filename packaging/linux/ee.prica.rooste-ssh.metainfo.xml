@@ -21,10 +21,11 @@
   <url type="bugtracker">https://github.com/rooste-ssh/rooste-ssh/issues</url>
   <content_rating type="oars-1.1"/>
   <provides>
-    <binary>rooste</binary>
+    <binary>rooste-ssh</binary>
     <binary>rooste-cli</binary>
   </provides>
   <releases>
+    <release version="0.6.0" date="2026-11-20"/>
     <release version="0.5.1" date="2026-11-05"/>
     <release version="0.5.0" date="2026-11-05"/>
     <release version="0.4.0" date="2026-10-17"/>
