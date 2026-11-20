@@ -143,8 +143,11 @@ pub enum MachineEvent {
     },
     /// Diagnostic protocol log line.
     ProtocolLog(String),
-    /// Control mode exited cleanly or with a reason.
-    Detached { reason: Option<String> },
+    /// Control mode exited cleanly or with a reason and any trailing output.
+    Detached {
+        reason: Option<String>,
+        trailing: Vec<u8>,
+    },
 }
 
 /// Pure sans-I/O state machine managing a `tmux -CC` control session.
@@ -156,6 +159,7 @@ pub struct TmuxMachine {
     pub session_name: String,
     pub windows: BTreeMap<TmuxWindowId, TmuxWindowSnapshot>,
     pub panes: BTreeMap<TmuxPaneId, TmuxPaneSnapshot>,
+    staged_windows: Option<BTreeMap<TmuxWindowId, TmuxWindowSnapshot>>,
     scrollback_capture: usize,
     pause_after_secs: u16,
     attached_once: bool,
@@ -184,7 +188,12 @@ impl TmuxMachine {
             session_name: "tmux".to_owned(),
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
-            scrollback_capture: scrollback_capture.clamp(100, 50_000),
+            staged_windows: None,
+            scrollback_capture: if scrollback_capture == 0 {
+                0
+            } else {
+                scrollback_capture.clamp(100, 50_000)
+            },
             pause_after_secs: pause_after_secs.max(1),
             attached_once: false,
         };
@@ -274,6 +283,7 @@ impl TmuxMachine {
     ) {
         let cmd = self.pending.pop_front().unwrap_or(PendingCmd::UserCommand);
         if resp.is_error {
+            self.staged_windows = None;
             out.push(MachineEvent::ProtocolLog(format!(
                 "tmux command error: {}",
                 resp.lines.join(" | ")
@@ -282,7 +292,7 @@ impl TmuxMachine {
         }
         match cmd {
             PendingCmd::ListWindows => {
-                self.windows.clear();
+                let mut staged = BTreeMap::new();
                 for line in &resp.lines {
                     let mut parts = line.splitn(4, '\t');
                     let Some(win_id) = parts.next().and_then(|s| s.parse::<TmuxWindowId>().ok())
@@ -292,7 +302,7 @@ impl TmuxMachine {
                     let name = parts.next().unwrap_or("shell").to_owned();
                     let active = parts.next() == Some("1");
                     let layout = parts.next().and_then(|s| parse_layout(s).ok());
-                    self.windows.insert(
+                    staged.insert(
                         win_id,
                         TmuxWindowSnapshot {
                             id: win_id,
@@ -303,14 +313,15 @@ impl TmuxMachine {
                         },
                     );
                 }
+                self.staged_windows = Some(staged);
             }
             PendingCmd::ListPanes { finalize_attach } => {
+                let Some(mut staged_windows) = self.staged_windows.take() else {
+                    return;
+                };
                 let previous_panes: std::collections::HashSet<TmuxPaneId> =
                     self.panes.keys().copied().collect();
-                self.panes.clear();
-                for win in self.windows.values_mut() {
-                    win.panes.clear();
-                }
+                let mut new_panes = BTreeMap::new();
                 for line in &resp.lines {
                     let mut parts = line.splitn(7, '\t');
                     let Some(window_id) = parts.next().and_then(|s| s.parse::<TmuxWindowId>().ok())
@@ -342,8 +353,8 @@ impl TmuxMachine {
                         title,
                         cwd,
                     };
-                    self.panes.insert(pane_id, snap.clone());
-                    if let Some(win) = self.windows.get_mut(&window_id) {
+                    new_panes.insert(pane_id, snap.clone());
+                    if let Some(win) = staged_windows.get_mut(&window_id) {
                         win.panes.push(snap);
                     }
                     // Capture initial scrollback for newly discovered panes.
@@ -360,6 +371,8 @@ impl TmuxMachine {
                         );
                     }
                 }
+                self.windows = staged_windows;
+                self.panes = new_panes;
                 if finalize_attach || !self.attached_once {
                     self.attached_once = true;
                 }
@@ -421,9 +434,13 @@ impl TmuxMachine {
                 }
                 out.push(MachineEvent::Notification(notif));
             }
-            TmuxNotification::WindowClose { window } => {
-                self.windows.remove(&window);
-                self.panes.retain(|_, p| p.window_id != window);
+            TmuxNotification::WindowClose { window: _ } => {
+                // If sessions A and B share a window and B unlinks it, tmux 3.5a can send %window-close
+                // to A while the window is still linked to A. Trigger a topology sync to verify window membership
+                // instead of prematurely dropping it.
+                if self.attached_once {
+                    self.queue_sync_topology(follow_up_cmds, false);
+                }
                 out.push(MachineEvent::Notification(notif));
             }
             TmuxNotification::PaneExited { pane } => {
@@ -442,21 +459,30 @@ impl TmuxMachine {
             TmuxNotification::LayoutChange {
                 window, ref layout, ..
             } => {
-                let mut unknown_pane = false;
-                for (pane_id, geom) in layout.panes() {
-                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                let mut panes_changed = false;
+                let layout_panes = layout.panes();
+                let layout_pane_ids: std::collections::HashSet<TmuxPaneId> =
+                    layout_panes.iter().map(|(id, _)| *id).collect();
+
+                for (pane_id, geom) in &layout_panes {
+                    if let Some(pane) = self.panes.get_mut(pane_id) {
                         pane.cols = geom.cols;
                         pane.rows = geom.rows;
                     } else {
-                        unknown_pane = true;
+                        panes_changed = true;
                     }
                 }
                 if let Some(win) = self.windows.get_mut(&window) {
+                    let tracked_ids: std::collections::HashSet<TmuxPaneId> =
+                        win.panes.iter().map(|p| p.pane_id).collect();
+                    if tracked_ids != layout_pane_ids {
+                        panes_changed = true;
+                    }
                     win.layout = Some(layout.clone());
                 } else {
-                    unknown_pane = true;
+                    panes_changed = true;
                 }
-                if unknown_pane && self.attached_once {
+                if panes_changed && self.attached_once {
                     self.queue_sync_topology(follow_up_cmds, false);
                 }
                 out.push(MachineEvent::Notification(notif));
@@ -482,8 +508,8 @@ impl TmuxMachine {
                     cwd,
                 });
             }
-            TmuxNotification::Exit { reason } => {
-                out.push(MachineEvent::Detached { reason });
+            TmuxNotification::Exit { reason, trailing } => {
+                out.push(MachineEvent::Detached { reason, trailing });
             }
             other => {
                 out.push(MachineEvent::Notification(other));
@@ -523,5 +549,123 @@ mod tests {
                 windows,
             } if session_name == "work" && windows.len() == 1 && windows[0].panes.len() == 1
         )));
+    }
+
+    #[test]
+    fn staged_topology_commits_only_when_both_commands_succeed() {
+        let (mut machine, _) = TmuxMachine::new(120, 40, 500, 5);
+        // Simulate initial commands: 4 setup commands
+        let init_acks = b"%begin 1 1 0\n%end 1 1 0\n\
+                          %begin 1 2 1\n%end 1 2 1\n\
+                          %begin 1 3 1\n%end 1 3 1\n\
+                          %begin 1 4 1\n%end 1 4 1\n";
+        machine.feed(init_acks);
+
+        // list-windows succeeds, but list-panes returns an error
+        let partial_fail = b"%begin 1 5 1\n\
+                             @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                             %end 1 5 1\n\
+                             %begin 1 6 1\n\
+                             error reading panes\n\
+                             %error 1 6 1\n";
+        let events = machine.feed(partial_fail);
+        // TopologySynced should NOT have been emitted because list-panes failed!
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MachineEvent::TopologySynced { .. }))
+        );
+        assert!(machine.windows.is_empty());
+        assert!(machine.panes.is_empty());
+    }
+
+    #[test]
+    fn scrollback_capture_zero_disables_pane_capture() {
+        let (mut machine, _) = TmuxMachine::new(120, 40, 0, 5);
+        let bootstrap = b"%begin 1 1 0\n%end 1 1 0\n\
+                          %begin 1 2 1\n%end 1 2 1\n\
+                          %begin 1 3 1\n%end 1 3 1\n\
+                          %begin 1 4 1\n%end 1 4 1\n\
+                          %begin 1 5 1\n\
+                          @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                          %end 1 5 1\n\
+                          %begin 1 6 1\n\
+                          @0\t%0\t1\t120\t40\tshell\t/home\n\
+                          %end 1 6 1\n";
+        let events = machine.feed(bootstrap);
+        // Ensure no SendCommands containing `capture-pane` was emitted
+        for event in events {
+            if let MachineEvent::SendCommands(cmd) = event {
+                assert!(
+                    !cmd.contains("capture-pane"),
+                    "expected no capture-pane command, got {cmd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layout_change_detects_removed_pane_and_triggers_sync() {
+        let (mut machine, _) = TmuxMachine::new(120, 40, 0, 5);
+        let bootstrap_2_panes = b"%begin 1 1 0\n%end 1 1 0\n\
+                                  %begin 1 2 1\n%end 1 2 1\n\
+                                  %begin 1 3 1\n%end 1 3 1\n\
+                                  %begin 1 4 1\n%end 1 4 1\n\
+                                  %begin 1 5 1\n\
+                                  @0\tdev\t1\ta1b2,120x40,0,0{60x40,0,0,0,60x40,60,0,1}\n\
+                                  %end 1 5 1\n\
+                                  %begin 1 6 1\n\
+                                  @0\t%0\t1\t60\t40\tshell\t/home\n\
+                                  @0\t%1\t0\t60\t40\tshell\t/home\n\
+                                  %end 1 6 1\n";
+        machine.feed(bootstrap_2_panes);
+        assert_eq!(machine.panes.len(), 2);
+
+        // tmux 3.5a closes pane 1: sends layout-change with only pane 0
+        let layout_change_1_pane = b"%layout-change @0 b25f,120x40,0,0,0 \n";
+        let events = machine.feed(layout_change_1_pane);
+        // Follow-up commands should request topology sync because pane 1 was removed
+        let has_sync = events.iter().any(|e| match e {
+            MachineEvent::SendCommands(cmd) => {
+                cmd.contains("list-windows") && cmd.contains("list-panes")
+            }
+            _ => false,
+        });
+        assert!(
+            has_sync,
+            "expected layout change to trigger topology sync for removed pane"
+        );
+    }
+
+    #[test]
+    fn layout_change_resize_only_does_not_trigger_sync() {
+        let (mut machine, _) = TmuxMachine::new(120, 40, 0, 5);
+        let bootstrap_1_pane = b"%begin 1 1 0\n%end 1 1 0\n\
+                                %begin 1 2 1\n%end 1 2 1\n\
+                                %begin 1 3 1\n%end 1 3 1\n\
+                                %begin 1 4 1\n%end 1 4 1\n\
+                                %begin 1 5 1\n\
+                                @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                                %end 1 5 1\n\
+                                %begin 1 6 1\n\
+                                @0\t%0\t1\t120\t40\tshell\t/home\n\
+                                %end 1 6 1\n";
+        machine.feed(bootstrap_1_pane);
+
+        // Simple resize of pane 0 to 140x50
+        let resize_pane_0 = b"%layout-change @0 b25f,140x50,0,0,0 \n";
+        let events = machine.feed(resize_pane_0);
+        let has_sync = events.iter().any(|e| match e {
+            MachineEvent::SendCommands(cmd) => {
+                cmd.contains("list-windows") || cmd.contains("list-panes")
+            }
+            _ => false,
+        });
+        assert!(
+            !has_sync,
+            "resize-only should update geometry without triggering full sync"
+        );
+        assert_eq!(machine.panes[&TmuxPaneId(0)].cols, 140);
+        assert_eq!(machine.panes[&TmuxPaneId(0)].rows, 50);
     }
 }

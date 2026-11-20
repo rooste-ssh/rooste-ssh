@@ -53,8 +53,6 @@ pub struct Settings {
     pub check_updates: bool,
     /// A release the user chose not to be told about again.
     pub skipped_version: String,
-    /// Automatically hide the `tmux -CC` gateway tab once native tmux panes open.
-    pub tmux_bury_gateway: bool,
     /// Number of scrollback lines captured per pane when attaching via `tmux -CC`.
     pub tmux_scrollback_capture: usize,
     /// Seconds of output lag before `tmux -CC` pauses a pane (`pause-after` flow control).
@@ -77,7 +75,6 @@ impl Default for Settings {
             use_builtin_agent: false,
             check_updates: true,
             skipped_version: String::new(),
-            tmux_bury_gateway: false,
             tmux_scrollback_capture: 1_000,
             tmux_pause_after_secs: 5,
         }

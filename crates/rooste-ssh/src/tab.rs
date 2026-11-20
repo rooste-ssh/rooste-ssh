@@ -58,6 +58,7 @@ pub enum TmuxRole {
         gateway_tab_id: u64,
         sender: SessionSender,
         session_id: TmuxSessionId,
+        session_name: String,
         window_id: TmuxWindowId,
         pane_id: TmuxPaneId,
         window_name: String,
@@ -334,7 +335,9 @@ impl SessionTab {
     ) -> Self {
         let mut view = TerminalView::default();
         theme::apply_to_view(&mut view, settings);
-        let (cols, rows) = (cols.max(1), rows.max(1));
+        const MAX_PANE_COLS: u16 = 1000;
+        const MAX_PANE_ROWS: u16 = 1000;
+        let (cols, rows) = (cols.clamp(1, MAX_PANE_COLS), rows.clamp(1, MAX_PANE_ROWS));
         let display_name = format!("[tmux:{session_name}] {window_name} ({pane_id})");
         Self {
             id: NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -369,6 +372,7 @@ impl SessionTab {
                 gateway_tab_id,
                 sender,
                 session_id,
+                session_name: session_name.to_owned(),
                 window_id,
                 pane_id,
                 window_name,
@@ -676,7 +680,10 @@ impl SessionTab {
                         bytes,
                     });
                 }
-                _ => {
+                TmuxRole::Gateway { .. } => {
+                    // Gateway tabs in tmux control mode do not accept terminal keyboard input.
+                }
+                TmuxRole::None => {
                     self.send_session(SessionCommand::Input(bytes));
                 }
             }
@@ -965,9 +972,27 @@ impl SessionTab {
                 }
                 SessionEvent::Closed { exit_status } => {
                     self.prompt = None;
-                    self.state = TabState::Closed(exit_status)
+                    self.state = TabState::Closed(exit_status);
+                    if matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
+                        self.tmux_role = TmuxRole::None;
+                        self.terminal.exit_tmux_control_mode();
+                        self.actions.push(TabAction::TmuxDetached {
+                            gateway_tab_id: self.id,
+                            reason: Some("Connection closed".to_owned()),
+                        });
+                    }
                 }
-                SessionEvent::Failed(failure) => self.failed(failure),
+                SessionEvent::Failed(failure) => {
+                    self.failed(failure);
+                    if matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
+                        self.tmux_role = TmuxRole::None;
+                        self.terminal.exit_tmux_control_mode();
+                        self.actions.push(TabAction::TmuxDetached {
+                            gateway_tab_id: self.id,
+                            reason: Some("Connection failed".to_owned()),
+                        });
+                    }
+                }
             }
         }
         if let TabState::Reconnecting { at, .. } = self.state {
@@ -1032,6 +1057,12 @@ impl SessionTab {
                 self.send_session(SessionCommand::Close);
             }
         }
+    }
+
+    /// Close the tab locally without sending remote kill or close commands.
+    pub fn close_locally(&mut self) {
+        self.answer_host_key(false);
+        self.answer_prompt(None);
     }
 
     fn tmux_gateway_ui(&mut self, ui: &mut Ui) {
@@ -1279,7 +1310,7 @@ impl SessionTab {
                 }
             }
             if !out.send.is_empty() {
-                if self.broadcast {
+                if self.broadcast && !matches!(self.tmux_role, TmuxRole::Gateway { .. }) {
                     self.outbox.extend(out.send);
                 } else {
                     self.send_input(out.send);

@@ -1065,7 +1065,7 @@ impl RoosteApp {
             })
             .collect();
         for tile_id in dead_tiles {
-            self.close_tab(tile_id);
+            self.remove_tab_locally(tile_id);
         }
 
         for win in windows {
@@ -1080,6 +1080,8 @@ impl RoosteApp {
                         if let TmuxRole::Pane {
                             window_id,
                             window_name,
+                            session_name: s_name,
+                            sender: s_sender,
                             cwd,
                             remote_geom,
                             ..
@@ -1087,10 +1089,12 @@ impl RoosteApp {
                         {
                             *window_id = win.id;
                             *window_name = win.name.clone();
+                            *s_name = session_name.clone();
+                            *s_sender = sender.clone();
                             if !pane.cwd.is_empty() {
                                 *cwd = pane.cwd.clone();
                             }
-                            *remote_geom = (pane.cols, pane.rows);
+                            *remote_geom = (pane.cols.clamp(1, 1000), pane.rows.clamp(1, 1000));
                         }
                     }
                 } else {
@@ -1151,7 +1155,7 @@ impl RoosteApp {
             })
             .collect();
         for tile_id in dead_tiles {
-            self.close_tab(tile_id);
+            self.remove_tab_locally(tile_id);
         }
 
         for (pane_id, geom) in &panes {
@@ -1159,7 +1163,7 @@ impl RoosteApp {
                 && let Some(tab) = self.tab_mut(tile_id)
                 && let TmuxRole::Pane { remote_geom, .. } = &mut tab.tmux_role
             {
-                *remote_geom = (geom.cols, geom.rows);
+                *remote_geom = (geom.cols.clamp(1, 1000), geom.rows.clamp(1, 1000));
             }
         }
     }
@@ -1188,12 +1192,12 @@ impl RoosteApp {
                     })
                     .collect();
                 for tile_id in to_remove {
-                    self.close_tab(tile_id);
+                    self.remove_tab_locally(tile_id);
                 }
             }
             TmuxNotification::PaneExited { pane } => {
                 if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane) {
-                    self.close_tab(tile_id);
+                    self.remove_tab_locally(tile_id);
                 }
             }
             TmuxNotification::WindowRenamed { window, name } => {
@@ -1205,13 +1209,14 @@ impl RoosteApp {
                             window_id: wid,
                             pane_id,
                             window_name,
+                            session_name,
                             ..
                         } = &mut tab.tmux_role
                         && *gw == gateway_tab_id
                         && *wid == window
                     {
                         *window_name = name.clone();
-                        tab.name = format!("[tmux] {} ({})", name, pane_id);
+                        tab.name = format!("[tmux:{session_name}] {} ({})", name, pane_id);
                     }
                 }
             }
@@ -1259,7 +1264,7 @@ impl RoosteApp {
             })
             .collect();
         for tile_id in to_remove {
-            self.tree.remove_recursively(tile_id);
+            self.remove_tab_locally(tile_id);
         }
         let msg = match reason {
             Some(r) if !r.is_empty() => format!("Detached from tmux session ({r})."),
@@ -1304,6 +1309,13 @@ impl RoosteApp {
             Some(_) => self.close_tab(id),
             None => {}
         }
+    }
+
+    fn remove_tab_locally(&mut self, id: TileId) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.close_locally();
+        }
+        self.tree.remove_recursively(id);
     }
 
     fn close_tab(&mut self, id: TileId) {
@@ -1977,7 +1989,9 @@ impl RoosteApp {
                     let broadcast = self.broadcast;
                     for (_, tile) in self.tree.tiles.iter_mut() {
                         if let Tile::Pane(tab) = tile {
-                            tab.broadcast = broadcast && tab.state == TabState::Connected;
+                            let is_tmux_gw = matches!(tab.tmux_role, TmuxRole::Gateway { .. });
+                            tab.broadcast =
+                                broadcast && tab.state == TabState::Connected && !is_tmux_gw;
                         }
                     }
                     crate::terminal_view::set_focus_pending(
@@ -2006,14 +2020,20 @@ impl RoosteApp {
         let mut input = Vec::new();
         for (_, tile) in self.tree.tiles.iter_mut() {
             if let Tile::Pane(tab) = tile {
-                input.append(&mut tab.outbox);
+                if !matches!(tab.tmux_role, TmuxRole::Gateway { .. }) {
+                    input.append(&mut tab.outbox);
+                } else {
+                    tab.outbox.clear();
+                }
             }
         }
         if input.is_empty() {
             return;
         }
         for (_, tile) in self.tree.tiles.iter_mut() {
-            if let Tile::Pane(tab) = tile {
+            if let Tile::Pane(tab) = tile
+                && !matches!(tab.tmux_role, TmuxRole::Gateway { .. })
+            {
                 tab.send_input(input.clone());
             }
         }

@@ -60,7 +60,10 @@ pub enum TmuxNotification {
         value: String,
     },
     /// `%exit [reason]`
-    Exit { reason: Option<String> },
+    Exit {
+        reason: Option<String>,
+        trailing: Vec<u8>,
+    },
 }
 
 /// A completed command response block delimited by `%begin` and `%end` / `%error`.
@@ -81,6 +84,9 @@ pub enum TmuxEvent {
     /// Raw protocol line for diagnostic logging in the Gateway tab.
     ProtocolLine(String),
 }
+
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_BLOCK_LINES: usize = 100_000;
 
 #[derive(Debug, Clone)]
 struct ActiveBlock {
@@ -106,21 +112,35 @@ impl ControlParser {
     /// Feed raw bytes read from the SSH transport into the parser.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TmuxEvent> {
         let mut events = Vec::new();
-        for &b in bytes {
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            idx += 1;
             if b == b'\n' {
                 if self.line_buf.last() == Some(&b'\r') {
                     self.line_buf.pop();
                 }
                 let raw_line = std::mem::take(&mut self.line_buf);
-                self.process_line(&raw_line, &mut events);
-            } else {
+                let is_exit = self.process_line(&raw_line, &mut events);
+                if is_exit {
+                    let trailing = bytes[idx..].to_vec();
+                    if let Some(TmuxEvent::Notification(TmuxNotification::Exit {
+                        trailing: t,
+                        ..
+                    })) = events.last_mut()
+                    {
+                        *t = trailing;
+                    }
+                    break;
+                }
+            } else if self.line_buf.len() < MAX_LINE_BYTES {
                 self.line_buf.push(b);
             }
         }
         events
     }
 
-    fn process_line(&mut self, raw: &[u8], events: &mut Vec<TmuxEvent>) {
+    fn process_line(&mut self, raw: &[u8], events: &mut Vec<TmuxEvent>) -> bool {
         // Strip leading DCS `\x1bP1000p` or ST `\x1b\\` sequences if present on the same line.
         let mut slice = raw;
         if let Some(rest) = slice.strip_prefix(b"\x1bP1000p") {
@@ -133,31 +153,72 @@ impl ControlParser {
             slice = rest;
         }
         if slice.is_empty() {
-            return;
+            return false;
         }
 
         let line_lossy = String::from_utf8_lossy(slice);
-        if self.log_lines && !slice.starts_with(b"%output ") {
+        if self.log_lines
+            && !slice.starts_with(b"%output ")
+            && !slice.starts_with(b"%extended-output ")
+        {
             events.push(TmuxEvent::ProtocolLine(line_lossy.into_owned()));
-        }
-
-        // Fast path for `%output %<id> <escaped>` using raw bytes before UTF-8 conversion.
-        if let Some(rest) = slice.strip_prefix(b"%output ")
-            && let Some(notif) = parse_output_line(rest)
-        {
-            events.push(TmuxEvent::Notification(notif));
-            return;
-        }
-        if let Some(rest) = slice.strip_prefix(b"%extended-output ")
-            && let Some(notif) = parse_extended_output_line(rest)
-        {
-            events.push(TmuxEvent::Notification(notif));
-            return;
         }
 
         let line = String::from_utf8_lossy(slice);
         let line_ref = line.as_ref();
 
+        // 1. If we are currently inside an active %begin..%end command block:
+        if let Some(block) = &self.active_block {
+            if let Some(args) = line_ref.strip_prefix("%end ")
+                && let Some((timestamp, command_num, flags)) = parse_block_header(args)
+                && command_num == block.command_num
+            {
+                let block = self.active_block.take().unwrap();
+                events.push(TmuxEvent::Response(TmuxResponse {
+                    timestamp: timestamp.max(block.timestamp),
+                    command_num: if command_num != 0 {
+                        command_num
+                    } else {
+                        block.command_num
+                    },
+                    flags: flags.max(block.flags),
+                    lines: block.lines,
+                    is_error: false,
+                }));
+                return false;
+            }
+
+            if let Some(args) = line_ref.strip_prefix("%error ")
+                && let Some((timestamp, command_num, flags)) = parse_block_header(args)
+                && command_num == block.command_num
+            {
+                let block = self.active_block.take().unwrap();
+                events.push(TmuxEvent::Response(TmuxResponse {
+                    timestamp: timestamp.max(block.timestamp),
+                    command_num: if command_num != 0 {
+                        command_num
+                    } else {
+                        block.command_num
+                    },
+                    flags: flags.max(block.flags),
+                    lines: block.lines,
+                    is_error: true,
+                }));
+                return false;
+            }
+
+            // In tmux control mode, notifications are NEVER dispatched inside a
+            // %begin..%end reply block. Any line inside the block (even if starting with %,
+            // like %exit or scrollback screen text) is plain command output data.
+            if let Some(block) = &mut self.active_block
+                && block.lines.len() < MAX_BLOCK_LINES
+            {
+                block.lines.push(line_ref.to_owned());
+            }
+            return false;
+        }
+
+        // 2. We are outside any command block:
         if let Some(args) = line_ref.strip_prefix("%begin ")
             && let Some((timestamp, command_num, flags)) = parse_block_header(args)
         {
@@ -167,56 +228,32 @@ impl ControlParser {
                 flags,
                 lines: Vec::new(),
             });
-            return;
+            return false;
         }
 
-        if let Some(args) = line_ref.strip_prefix("%end ")
-            && let Some((timestamp, command_num, flags)) = parse_block_header(args)
-            && let Some(block) = self.active_block.take()
+        // Fast path for `%output %<id> <escaped>` using raw bytes before UTF-8 conversion.
+        if let Some(rest) = slice.strip_prefix(b"%output ")
+            && let Some(notif) = parse_output_line(rest)
         {
-            events.push(TmuxEvent::Response(TmuxResponse {
-                timestamp: timestamp.max(block.timestamp),
-                command_num: if command_num != 0 {
-                    command_num
-                } else {
-                    block.command_num
-                },
-                flags: flags.max(block.flags),
-                lines: block.lines,
-                is_error: false,
-            }));
-            return;
+            events.push(TmuxEvent::Notification(notif));
+            return false;
         }
-
-        if let Some(args) = line_ref.strip_prefix("%error ")
-            && let Some((timestamp, command_num, flags)) = parse_block_header(args)
-            && let Some(block) = self.active_block.take()
+        if let Some(rest) = slice.strip_prefix(b"%extended-output ")
+            && let Some(notif) = parse_extended_output_line(rest)
         {
-            events.push(TmuxEvent::Response(TmuxResponse {
-                timestamp: timestamp.max(block.timestamp),
-                command_num: if command_num != 0 {
-                    command_num
-                } else {
-                    block.command_num
-                },
-                flags: flags.max(block.flags),
-                lines: block.lines,
-                is_error: true,
-            }));
-            return;
+            events.push(TmuxEvent::Notification(notif));
+            return false;
         }
 
-        // Asynchronous notifications can arrive both outside and inside `%begin..%end`.
         if line_ref.starts_with('%')
             && let Some(notif) = parse_notification(line_ref)
         {
+            let is_exit = matches!(notif, TmuxNotification::Exit { .. });
             events.push(TmuxEvent::Notification(notif));
-            return;
+            return is_exit;
         }
 
-        if let Some(block) = &mut self.active_block {
-            block.lines.push(line_ref.to_owned());
-        }
+        false
     }
 }
 
@@ -261,12 +298,16 @@ fn parse_notification(line: &str) -> Option<TmuxNotification> {
         return Some(TmuxNotification::SessionsChanged);
     }
     if line == "%exit" {
-        return Some(TmuxNotification::Exit { reason: None });
+        return Some(TmuxNotification::Exit {
+            reason: None,
+            trailing: Vec::new(),
+        });
     }
     if let Some(reason) = line.strip_prefix("%exit ") {
         let reason = reason.trim();
         return Some(TmuxNotification::Exit {
             reason: (!reason.is_empty()).then(|| reason.to_owned()),
+            trailing: Vec::new(),
         });
     }
     if let Some(arg) = line.strip_prefix("%window-add ") {
@@ -402,7 +443,8 @@ mod tests {
         assert_eq!(
             events[4],
             TmuxEvent::Notification(TmuxNotification::Exit {
-                reason: Some("detached".into())
+                reason: Some("detached".into()),
+                trailing: Vec::new(),
             })
         );
     }
@@ -423,6 +465,40 @@ mod tests {
             events[1],
             TmuxEvent::Notification(TmuxNotification::WindowClose {
                 window: TmuxWindowId(5)
+            })
+        );
+    }
+
+    #[test]
+    fn reply_block_ignores_inner_exit_and_notifications() {
+        let mut parser = ControlParser::new();
+        let stream =
+            b"%begin 100 1 1\nline 1\n%exit detached\n%layout-change @1 80x24\n%end 100 1 1\n";
+        let events = parser.feed(stream);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            TmuxEvent::Response(r) => {
+                assert_eq!(r.command_num, 1);
+                assert_eq!(r.lines.len(), 3);
+                assert_eq!(r.lines[0], "line 1");
+                assert_eq!(r.lines[1], "%exit detached");
+                assert_eq!(r.lines[2], "%layout-change @1 80x24");
+            }
+            other => panic!("expected response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn exit_captures_trailing_bytes_after_newline() {
+        let mut parser = ControlParser::new();
+        let stream = b"%exit\nuser@host:~$ ";
+        let events = parser.feed(stream);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            TmuxEvent::Notification(TmuxNotification::Exit {
+                reason: None,
+                trailing: b"user@host:~$ ".to_vec(),
             })
         );
     }

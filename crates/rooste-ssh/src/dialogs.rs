@@ -566,10 +566,6 @@ impl SettingsEditor {
                                 &mut s.auto_reconnect,
                                 "Reconnect automatically when a connection drops",
                             );
-                            ui.checkbox(
-                                &mut s.tmux_bury_gateway,
-                                "Hide tmux (-CC) gateway tab when panes open",
-                            );
                             ui.checkbox(&mut s.check_updates, "Check for updates at startup");
                         });
                     });

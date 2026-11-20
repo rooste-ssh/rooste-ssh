@@ -91,14 +91,19 @@ pub fn parse_layout(input: &str) -> Result<LayoutNode, LayoutError> {
         }
         _ => trimmed,
     };
-    let (node, rest) = parse_node(body).map_err(err)?;
+    let (node, rest) = parse_node(body, 0).map_err(err)?;
     if !rest.is_empty() {
         return Err(err("unexpected trailing characters"));
     }
     Ok(node)
 }
 
-fn parse_node(s: &str) -> Result<(LayoutNode, &str), &'static str> {
+const MAX_LAYOUT_DEPTH: usize = 32;
+
+fn parse_node(s: &str, depth: usize) -> Result<(LayoutNode, &str), &'static str> {
+    if depth > MAX_LAYOUT_DEPTH {
+        return Err("layout tree exceeds maximum depth");
+    }
     let (cols, s) = parse_u16_until(s, 'x')?;
     let (rows, s) = parse_u16_until(s, ',')?;
     let (x, s) = parse_u16_until(s, ',')?;
@@ -107,11 +112,11 @@ fn parse_node(s: &str) -> Result<(LayoutNode, &str), &'static str> {
 
     match s.chars().next() {
         Some('{') => {
-            let (children, rest) = parse_children(&s[1..], '}')?;
+            let (children, rest) = parse_children(&s[1..], '}', depth + 1)?;
             Ok((LayoutNode::HorizontalSplit { geom, children }, rest))
         }
         Some('[') => {
-            let (children, rest) = parse_children(&s[1..], ']')?;
+            let (children, rest) = parse_children(&s[1..], ']', depth + 1)?;
             Ok((LayoutNode::VerticalSplit { geom, children }, rest))
         }
         Some(',') => {
@@ -128,10 +133,14 @@ fn parse_node(s: &str) -> Result<(LayoutNode, &str), &'static str> {
     }
 }
 
-fn parse_children(mut s: &str, closing: char) -> Result<(Vec<LayoutNode>, &str), &'static str> {
+fn parse_children(
+    mut s: &str,
+    closing: char,
+    depth: usize,
+) -> Result<(Vec<LayoutNode>, &str), &'static str> {
     let mut children = Vec::new();
     loop {
-        let (child, rest) = parse_node(s)?;
+        let (child, rest) = parse_node(s, depth)?;
         children.push(child);
         match rest.chars().next() {
             Some(',') => s = &rest[1..],
@@ -199,5 +208,20 @@ mod tests {
         assert_eq!(panes[0].0, TmuxPaneId(1));
         assert_eq!(panes[1].0, TmuxPaneId(2));
         assert_eq!(panes[2].0, TmuxPaneId(5));
+    }
+
+    #[test]
+    fn rejects_excessively_deep_layout() {
+        let mut deep = String::from("0000,100x100,0,0");
+        for _ in 0..40 {
+            deep.push_str("{100x100,0,0");
+        }
+        deep.push_str(",1");
+        for _ in 0..40 {
+            deep.push('}');
+        }
+        let err = parse_layout(&deep);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("maximum depth"));
     }
 }

@@ -4689,6 +4689,7 @@ dependencies = [
  "alacritty_terminal",
  "criterion",
  "insta",
+ "rooste-tmux",
 ]
 
 [[package]]
