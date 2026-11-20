@@ -252,7 +252,7 @@ impl Profile {
                 .collect()
         };
         let session = if name.is_empty() { "main" } else { &name };
-        Some(format!("tmux -CC new-session -A -s {session}\n"))
+        Some(format!("tmux -u -CC new-session -A -s {session}\n"))
     }
 
     /// Name shown in lists: the profile name, or `user@host`.
@@ -417,12 +417,12 @@ mod tests {
         p.tmux_auto_attach = true;
         assert_eq!(
             p.tmux_attach_command().as_deref(),
-            Some("tmux -CC new-session -A -s main\n")
+            Some("tmux -u -CC new-session -A -s main\n")
         );
         p.tmux_session_name = "dev-work_1".into();
         assert_eq!(
             p.tmux_attach_command().as_deref(),
-            Some("tmux -CC new-session -A -s dev-work_1\n")
+            Some("tmux -u -CC new-session -A -s dev-work_1\n")
         );
     }
 }

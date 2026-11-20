@@ -494,7 +494,9 @@ async fn handle_tmux_command<T: Transport>(
         }
         SessionCommand::Resize(cols, rows) => {
             *client_size = (cols.max(1), rows.max(1));
-            if let Some(machine) = tmux.as_mut() {
+            if let Some(machine) = tmux.as_mut().filter(|m| !m.is_ready()) {
+                machine.set_client_size(client_size.0, client_size.1);
+            } else if let Some(machine) = tmux.as_mut() {
                 machine.register_user_command();
                 write_raw_text(
                     transport,
@@ -506,7 +508,7 @@ async fn handle_tmux_command<T: Transport>(
             }
         }
         SessionCommand::TmuxPaneInput { pane_id, bytes } => {
-            if let Some(machine) = tmux.as_mut() {
+            if let Some(machine) = tmux.as_mut().filter(|m| m.is_ready()) {
                 let cmd = encode_send_keys_hex(pane_id, &bytes);
                 if !cmd.is_empty() {
                     machine.register_user_command();
@@ -519,7 +521,7 @@ async fn handle_tmux_command<T: Transport>(
             text,
             bracketed,
         } => {
-            if let Some(machine) = tmux.as_mut() {
+            if let Some(machine) = tmux.as_mut().filter(|m| m.is_ready()) {
                 let cmd = encode_paste_hex(pane_id, &text, bracketed);
                 if !cmd.is_empty() {
                     machine.register_user_command();
@@ -529,7 +531,9 @@ async fn handle_tmux_command<T: Transport>(
         }
         SessionCommand::TmuxResizeClient { cols, rows } => {
             *client_size = (cols.max(20), rows.max(5));
-            if let Some(machine) = tmux.as_mut() {
+            if let Some(machine) = tmux.as_mut().filter(|m| !m.is_ready()) {
+                machine.set_client_size(client_size.0, client_size.1);
+            } else if let Some(machine) = tmux.as_mut().filter(|m| m.is_ready()) {
                 machine.register_user_command();
                 write_raw_text(
                     transport,
@@ -543,7 +547,7 @@ async fn handle_tmux_command<T: Transport>(
             cols,
             rows,
         } => {
-            if let Some(machine) = tmux.as_mut() {
+            if let Some(machine) = tmux.as_mut().filter(|m| m.is_ready()) {
                 machine.register_user_command();
                 write_raw_text(
                     transport,
@@ -558,18 +562,11 @@ async fn handle_tmux_command<T: Transport>(
             }
         }
         SessionCommand::TmuxAction(action) => {
-            if let Some(machine) = tmux.as_mut() {
+            if let Some(machine) = tmux.as_mut().filter(|m| m.is_ready()) {
                 match action {
                     TmuxClientAction::RawCommand { command } => {
-                        let lines: Vec<&str> = command
-                            .split(';')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        for line in lines {
-                            machine.register_user_command();
-                            write_raw_text(transport, &format!("{line}\n")).await?;
-                        }
+                        let cmd = machine.queue_raw_command(&command);
+                        write_raw_text(transport, &cmd).await?;
                     }
                     action => {
                         let cmd = action.to_command_string();
@@ -644,15 +641,12 @@ async fn pump<T: Transport>(
                         if !before.is_empty() {
                             sink.send(SessionEvent::Output(before.to_vec()));
                         }
-                        let (mut machine, init_cmds) = TmuxMachine::new(
+                        let mut machine = TmuxMachine::new(
                             client_size.0,
                             client_size.1,
                             scrollback_capture,
                             pause_after,
                         );
-                        if let Err(e) = transport.write(init_cmds.as_bytes()).await {
-                            return Err(Failure::lost(format!("Connection lost: {e}")));
-                        }
                         let events = machine.feed(after);
                         if !dispatch_tmux_events(events, &mut transport, sink).await? {
                             tmux = Some(machine);
@@ -811,15 +805,12 @@ async fn run_ssh(
                         if !before.is_empty() {
                             sink.send(SessionEvent::Output(before.to_vec()));
                         }
-                        let (mut machine, init_cmds) = TmuxMachine::new(
+                        let mut machine = TmuxMachine::new(
                             client_size.0,
                             client_size.1,
                             scrollback_capture,
                             pause_after,
                         );
-                        if let Err(e) = shell.write(init_cmds.as_bytes()).await {
-                            return Err(Failure::lost(format!("Connection lost: {e}")));
-                        }
                         let events = machine.feed(after);
                         if !dispatch_tmux_events(events, &mut shell, sink).await? {
                             tmux = Some(machine);

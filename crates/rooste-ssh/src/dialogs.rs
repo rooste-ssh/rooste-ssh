@@ -294,7 +294,7 @@ impl ProfileEditor {
                                             "Attach to tmux (-CC) on connect",
                                         )
                                         .on_hover_text(
-                                            "Run `tmux -CC new-session -A -s <session>` automatically \
+                                            "Run `tmux -u -CC new-session -A -s <session>` automatically \
                                              so remote tmux windows and splits open as native tabs and panes.",
                                         );
                                     });

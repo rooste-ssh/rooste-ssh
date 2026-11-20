@@ -7,6 +7,14 @@ use crate::layout::{LayoutNode, parse_layout};
 use crate::parser::{ControlParser, TmuxEvent, TmuxNotification, TmuxResponse};
 use crate::unescape::escape_tmux_arg;
 
+/// Separates fields in the `-F` formats we ask tmux for.
+///
+/// It must be printable ASCII: without a UTF-8 locale on the server, tmux
+/// replaces tabs and other control characters in control-mode replies with `_`.
+/// Free-text fields (names, paths, titles) come last, so only the final field
+/// could ever contain it, and `splitn` keeps that field whole.
+const FIELD_SEP: &str = "|~|";
+
 /// Snapshot of a remote tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxPaneSnapshot {
@@ -92,11 +100,13 @@ impl TmuxClientAction {
                 format!("set-window-option -t {} synchronize-panes\n", window)
             }
             Self::RawCommand { command } => {
-                let trimmed = command.trim();
-                if trimmed.is_empty() {
+                // One line only: a newline would end the command early.
+                let line = command.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+                let line = line.trim();
+                if line.is_empty() {
                     String::new()
                 } else {
-                    format!("{trimmed}\n")
+                    format!("{line}\n")
                 }
             }
         }
@@ -118,6 +128,12 @@ enum PendingCmd {
         pane: TmuxPaneId,
     },
     UserCommand,
+    /// A command typed by the user, which may run any number of commands
+    /// (`a ; b`, `if-shell … { … }`), each with its own reply block. Every
+    /// reply is the user's until the marker sent after it comes back.
+    UserCommandsUntil {
+        marker: String,
+    },
 }
 
 /// High-level output produced by [`TmuxMachine`] after processing incoming bytes.
@@ -163,17 +179,29 @@ pub struct TmuxMachine {
     scrollback_capture: usize,
     pause_after_secs: u16,
     attached_once: bool,
+    /// Error text tmux reported for its own attach command, shown on `%exit`.
+    attach_error: Option<String>,
+    /// Client size sent with `refresh-client -C` once attached.
+    client_size: (u16, u16),
+    /// tmux accepted the attach and the bootstrap commands were queued.
+    ready: bool,
+    /// Counter that makes each [`PendingCmd::UserCommandsUntil`] marker unique.
+    next_marker: u64,
 }
 
 impl TmuxMachine {
-    /// Create a new state machine and return the machine along with the initial
-    /// bootstrap command sequence to send over the SSH transport.
+    /// Create a new state machine for a `tmux -CC` client that just started.
+    ///
+    /// Nothing is sent yet: tmux first answers its own attach command, and the
+    /// bootstrap commands go out (as [`MachineEvent::SendCommands`]) only once
+    /// that succeeded. If the attach fails, tmux exits straight away and
+    /// anything sent would land in the user's shell instead.
     pub fn new(
         client_cols: u16,
         client_rows: u16,
         scrollback_capture: usize,
         pause_after_secs: u16,
-    ) -> (Self, String) {
+    ) -> Self {
         let mut parser = ControlParser::new();
         parser.log_lines = true;
         let mut pending = VecDeque::new();
@@ -181,7 +209,7 @@ impl TmuxMachine {
         // `new-session` or `attach-session` command itself before our commands run.
         pending.push_back(PendingCmd::InitialAttach);
 
-        let mut machine = Self {
+        Self {
             parser,
             pending,
             session_id: TmuxSessionId(0),
@@ -196,34 +224,66 @@ impl TmuxMachine {
             },
             pause_after_secs: pause_after_secs.max(1),
             attached_once: false,
-        };
+            attach_error: None,
+            client_size: (client_cols.max(20), client_rows.max(5)),
+            ready: false,
+            next_marker: 0,
+        }
+    }
 
-        let mut init_cmds = String::new();
-        machine.queue_command(
+    /// Prepare a command the user typed, returning the text to send.
+    ///
+    /// tmux replies to each command the line runs, and how many that is can't
+    /// be told from the text, so a `display-message` marker follows it.
+    pub fn queue_raw_command(&mut self, command: &str) -> String {
+        let cmd = TmuxClientAction::RawCommand {
+            command: command.to_owned(),
+        }
+        .to_command_string();
+        if cmd.is_empty() {
+            return cmd;
+        }
+        self.next_marker += 1;
+        let marker = format!("rooste-sync-{}", self.next_marker);
+        let text = format!("{cmd}display-message -p {marker}\n");
+        self.pending
+            .push_back(PendingCmd::UserCommandsUntil { marker });
+        text
+    }
+
+    /// Whether tmux accepted the attach, so commands may be sent to it.
+    ///
+    /// Until then, anything written could reach the shell instead (if the
+    /// attach fails), so callers must hold their commands back.
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Remember the client size to send once attached.
+    pub fn set_client_size(&mut self, cols: u16, rows: u16) {
+        self.client_size = (cols.max(20), rows.max(5));
+    }
+
+    /// Queue the commands that set up the client and load the session's state.
+    fn queue_bootstrap(&mut self, out: &mut String) {
+        self.ready = true;
+        let (cols, rows) = self.client_size;
+        self.queue_command(
             PendingCmd::RefreshClientSize,
-            &format!(
-                "refresh-client -C {}x{}\n",
-                client_cols.max(20),
-                client_rows.max(5)
-            ),
-            &mut init_cmds,
+            &format!("refresh-client -C {cols}x{rows}\n"),
+            out,
         );
-        machine.queue_command(
+        self.queue_command(
             PendingCmd::RefreshClientFlags,
-            &format!(
-                "refresh-client -f pause-after={}\n",
-                machine.pause_after_secs
-            ),
-            &mut init_cmds,
+            &format!("refresh-client -f pause-after={}\n", self.pause_after_secs),
+            out,
         );
-        machine.queue_command(
+        self.queue_command(
             PendingCmd::SubscribeFormats,
-            "refresh-client -B \"rooste_meta:%*:#{pane_title}\\t#{pane_current_path}\"\n",
-            &mut init_cmds,
+            "refresh-client -B \"rooste_meta:%*:#{pane_current_path}|~|#{pane_title}\"\n",
+            out,
         );
-        machine.queue_sync_topology(&mut init_cmds, true);
-
-        (machine, init_cmds)
+        self.queue_sync_topology(out, true);
     }
 
     fn queue_command(&mut self, kind: PendingCmd, raw: &str, out: &mut String) {
@@ -235,12 +295,12 @@ impl TmuxMachine {
     pub fn queue_sync_topology(&mut self, out: &mut String, finalize_attach: bool) {
         self.queue_command(
             PendingCmd::ListWindows,
-            "list-windows -F \"#{window_id}\\t#{window_name}\\t#{window_active}\\t#{window_layout}\"\n",
+            "list-windows -F \"#{window_id}|~|#{window_active}|~|#{window_layout}|~|#{window_name}\"\n",
             out,
         );
         self.queue_command(
             PendingCmd::ListPanes { finalize_attach },
-            "list-panes -s -F \"#{window_id}\\t#{pane_id}\\t#{pane_active}\\t#{pane_width}\\t#{pane_height}\\t#{pane_title}\\t#{pane_current_path}\"\n",
+            "list-panes -s -F \"#{window_id}|~|#{pane_id}|~|#{pane_active}|~|#{pane_width}|~|#{pane_height}|~|#{pane_current_path}|~|#{pane_title}\"\n",
             out,
         );
     }
@@ -269,7 +329,11 @@ impl TmuxMachine {
             }
         }
 
-        if !follow_up_cmds.is_empty() {
+        // After `%exit` the shell is reading again, so nothing more may be sent.
+        let exited = out
+            .iter()
+            .any(|e| matches!(e, MachineEvent::Detached { .. }));
+        if !follow_up_cmds.is_empty() && !exited {
             out.insert(0, MachineEvent::SendCommands(follow_up_cmds));
         }
         out
@@ -281,7 +345,26 @@ impl TmuxMachine {
         out: &mut Vec<MachineEvent>,
         follow_up_cmds: &mut String,
     ) {
+        if let Some(PendingCmd::UserCommandsUntil { marker }) = self.pending.front() {
+            if !resp.is_error && resp.lines.len() == 1 && resp.lines[0] == *marker {
+                self.pending.pop_front();
+            } else if resp.is_error {
+                out.push(MachineEvent::ProtocolLog(format!(
+                    "tmux command error: {}",
+                    resp.lines.join(" | ")
+                )));
+            }
+            return;
+        }
         let cmd = self.pending.pop_front().unwrap_or(PendingCmd::UserCommand);
+        if cmd == PendingCmd::InitialAttach {
+            if resp.is_error {
+                self.attach_error = Some(resp.lines.join(" ")).filter(|e| !e.is_empty());
+            } else {
+                self.queue_bootstrap(follow_up_cmds);
+            }
+            return;
+        }
         if resp.is_error {
             self.staged_windows = None;
             out.push(MachineEvent::ProtocolLog(format!(
@@ -294,14 +377,14 @@ impl TmuxMachine {
             PendingCmd::ListWindows => {
                 let mut staged = BTreeMap::new();
                 for line in &resp.lines {
-                    let mut parts = line.splitn(4, '\t');
+                    let mut parts = line.splitn(4, FIELD_SEP);
                     let Some(win_id) = parts.next().and_then(|s| s.parse::<TmuxWindowId>().ok())
                     else {
                         continue;
                     };
-                    let name = parts.next().unwrap_or("shell").to_owned();
                     let active = parts.next() == Some("1");
                     let layout = parts.next().and_then(|s| parse_layout(s).ok());
+                    let name = parts.next().unwrap_or("shell").to_owned();
                     staged.insert(
                         win_id,
                         TmuxWindowSnapshot {
@@ -323,7 +406,7 @@ impl TmuxMachine {
                     self.panes.keys().copied().collect();
                 let mut new_panes = BTreeMap::new();
                 for line in &resp.lines {
-                    let mut parts = line.splitn(7, '\t');
+                    let mut parts = line.splitn(7, FIELD_SEP);
                     let Some(window_id) = parts.next().and_then(|s| s.parse::<TmuxWindowId>().ok())
                     else {
                         continue;
@@ -341,8 +424,8 @@ impl TmuxMachine {
                         .next()
                         .and_then(|s| s.parse::<u16>().ok())
                         .unwrap_or(24);
-                    let title = parts.next().unwrap_or_default().to_owned();
                     let cwd = parts.next().unwrap_or_default().to_owned();
+                    let title = parts.next().unwrap_or_default().to_owned();
 
                     let snap = TmuxPaneSnapshot {
                         window_id,
@@ -402,7 +485,8 @@ impl TmuxMachine {
             | PendingCmd::RefreshClientSize
             | PendingCmd::RefreshClientFlags
             | PendingCmd::SubscribeFormats
-            | PendingCmd::UserCommand => {}
+            | PendingCmd::UserCommand
+            | PendingCmd::UserCommandsUntil { .. } => {}
         }
     }
 
@@ -492,10 +576,10 @@ impl TmuxMachine {
                 ref value,
                 ..
             } => {
-                let (title, cwd) = value
-                    .split_once('\t')
-                    .map(|(t, c)| (t.to_owned(), c.to_owned()))
-                    .unwrap_or_else(|| (value.clone(), String::new()));
+                let (cwd, title) = value
+                    .split_once(FIELD_SEP)
+                    .map(|(c, t)| (c.to_owned(), t.to_owned()))
+                    .unwrap_or_else(|| (String::new(), value.clone()));
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     pane.title = title.clone();
                     if !cwd.is_empty() {
@@ -509,6 +593,7 @@ impl TmuxMachine {
                 });
             }
             TmuxNotification::Exit { reason, trailing } => {
+                let reason = self.attach_error.take().or(reason);
                 out.push(MachineEvent::Detached { reason, trailing });
             }
             other => {
@@ -524,21 +609,32 @@ mod tests {
 
     #[test]
     fn machine_bootstraps_and_syncs_topology() {
-        let (mut machine, init_cmds) = TmuxMachine::new(120, 40, 500, 5);
+        let mut machine = TmuxMachine::new(120, 40, 500, 5);
+        // Nothing goes out before tmux has answered its own attach command.
+        let events = machine.feed(b"%begin 1 1 0\n");
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, MachineEvent::SendCommands(_)))
+        );
+        let events = machine.feed(b"%end 1 1 0\n");
+        let Some(MachineEvent::SendCommands(init_cmds)) = events.first() else {
+            panic!("expected bootstrap commands, got {events:?}");
+        };
         assert!(init_cmds.contains("refresh-client -C 120x40"));
         assert!(init_cmds.contains("list-windows"));
         assert!(init_cmds.contains("list-panes"));
 
-        let simulated = b"%begin 1 1 0\n%end 1 1 0\n\
+        let simulated = b"\
                           %session-changed $0 work\n\
                           %begin 1 2 1\n%end 1 2 1\n\
                           %begin 1 3 1\n%end 1 3 1\n\
                           %begin 1 4 1\n%end 1 4 1\n\
                           %begin 1 5 1\n\
-                          @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                          @0|~|1|~|b25f,120x40,0,0,0|~|dev\n\
                           %end 1 5 1\n\
                           %begin 1 6 1\n\
-                          @0\t%0\t1\t120\t40\tnvim\t/home/alex/project\n\
+                          @0|~|%0|~|1|~|120|~|40|~|/home/alex/project|~|nvim\n\
                           %end 1 6 1\n";
         let events = machine.feed(simulated);
         assert!(events.iter().any(|e| matches!(
@@ -553,7 +649,7 @@ mod tests {
 
     #[test]
     fn staged_topology_commits_only_when_both_commands_succeed() {
-        let (mut machine, _) = TmuxMachine::new(120, 40, 500, 5);
+        let mut machine = TmuxMachine::new(120, 40, 500, 5);
         // Simulate initial commands: 4 setup commands
         let init_acks = b"%begin 1 1 0\n%end 1 1 0\n\
                           %begin 1 2 1\n%end 1 2 1\n\
@@ -563,7 +659,7 @@ mod tests {
 
         // list-windows succeeds, but list-panes returns an error
         let partial_fail = b"%begin 1 5 1\n\
-                             @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                             @0|~|1|~|b25f,120x40,0,0,0|~|dev\n\
                              %end 1 5 1\n\
                              %begin 1 6 1\n\
                              error reading panes\n\
@@ -581,16 +677,16 @@ mod tests {
 
     #[test]
     fn scrollback_capture_zero_disables_pane_capture() {
-        let (mut machine, _) = TmuxMachine::new(120, 40, 0, 5);
+        let mut machine = TmuxMachine::new(120, 40, 0, 5);
         let bootstrap = b"%begin 1 1 0\n%end 1 1 0\n\
                           %begin 1 2 1\n%end 1 2 1\n\
                           %begin 1 3 1\n%end 1 3 1\n\
                           %begin 1 4 1\n%end 1 4 1\n\
                           %begin 1 5 1\n\
-                          @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                          @0|~|1|~|b25f,120x40,0,0,0|~|dev\n\
                           %end 1 5 1\n\
                           %begin 1 6 1\n\
-                          @0\t%0\t1\t120\t40\tshell\t/home\n\
+                          @0|~|%0|~|1|~|120|~|40|~|/home|~|shell\n\
                           %end 1 6 1\n";
         let events = machine.feed(bootstrap);
         // Ensure no SendCommands containing `capture-pane` was emitted
@@ -606,17 +702,17 @@ mod tests {
 
     #[test]
     fn layout_change_detects_removed_pane_and_triggers_sync() {
-        let (mut machine, _) = TmuxMachine::new(120, 40, 0, 5);
+        let mut machine = TmuxMachine::new(120, 40, 0, 5);
         let bootstrap_2_panes = b"%begin 1 1 0\n%end 1 1 0\n\
                                   %begin 1 2 1\n%end 1 2 1\n\
                                   %begin 1 3 1\n%end 1 3 1\n\
                                   %begin 1 4 1\n%end 1 4 1\n\
                                   %begin 1 5 1\n\
-                                  @0\tdev\t1\ta1b2,120x40,0,0{60x40,0,0,0,60x40,60,0,1}\n\
+                                  @0|~|1|~|a1b2,120x40,0,0{60x40,0,0,0,60x40,60,0,1}|~|dev\n\
                                   %end 1 5 1\n\
                                   %begin 1 6 1\n\
-                                  @0\t%0\t1\t60\t40\tshell\t/home\n\
-                                  @0\t%1\t0\t60\t40\tshell\t/home\n\
+                                  @0|~|%0|~|1|~|60|~|40|~|/home|~|shell\n\
+                                  @0|~|%1|~|0|~|60|~|40|~|/home|~|shell\n\
                                   %end 1 6 1\n";
         machine.feed(bootstrap_2_panes);
         assert_eq!(machine.panes.len(), 2);
@@ -639,16 +735,16 @@ mod tests {
 
     #[test]
     fn layout_change_resize_only_does_not_trigger_sync() {
-        let (mut machine, _) = TmuxMachine::new(120, 40, 0, 5);
+        let mut machine = TmuxMachine::new(120, 40, 0, 5);
         let bootstrap_1_pane = b"%begin 1 1 0\n%end 1 1 0\n\
                                 %begin 1 2 1\n%end 1 2 1\n\
                                 %begin 1 3 1\n%end 1 3 1\n\
                                 %begin 1 4 1\n%end 1 4 1\n\
                                 %begin 1 5 1\n\
-                                @0\tdev\t1\tb25f,120x40,0,0,0\n\
+                                @0|~|1|~|b25f,120x40,0,0,0|~|dev\n\
                                 %end 1 5 1\n\
                                 %begin 1 6 1\n\
-                                @0\t%0\t1\t120\t40\tshell\t/home\n\
+                                @0|~|%0|~|1|~|120|~|40|~|/home|~|shell\n\
                                 %end 1 6 1\n";
         machine.feed(bootstrap_1_pane);
 
@@ -667,5 +763,89 @@ mod tests {
         );
         assert_eq!(machine.panes[&TmuxPaneId(0)].cols, 140);
         assert_eq!(machine.panes[&TmuxPaneId(0)].rows, 50);
+    }
+
+    #[test]
+    fn failed_attach_sends_nothing_and_reports_the_error() {
+        // What tmux 3.5a sends for `tmux -CC attach -t missing`.
+        let mut machine = TmuxMachine::new(120, 40, 500, 5);
+        let events = machine.feed(
+            b"%begin 1795194397 343 0\r\ncan't find session: missing\r\n\
+              %error 1795194397 343 0\r\n%exit\r\n\x1b\\",
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, MachineEvent::SendCommands(_))),
+            "nothing may be sent to a shell: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            MachineEvent::Detached { reason: Some(r), .. } if r == "can't find session: missing"
+        )));
+    }
+
+    #[test]
+    fn free_text_fields_keep_separators_and_spaces() {
+        let mut machine = TmuxMachine::new(120, 40, 0, 5);
+        let events = machine.feed(
+            b"%begin 1 1 0\n%end 1 1 0\n\
+              %begin 1 2 1\n%end 1 2 1\n\
+              %begin 1 3 1\n%end 1 3 1\n\
+              %begin 1 4 1\n%end 1 4 1\n\
+              %begin 1 5 1\n\
+              @0|~|1|~|b25f,120x40,0,0,0|~|my window|~|odd\n\
+              %end 1 5 1\n\
+              %begin 1 6 1\n\
+              @0|~|%0|~|1|~|120|~|40|~|/home/a b|~|vim: a|~|b.txt\n\
+              %end 1 6 1\n",
+        );
+        let windows = events
+            .iter()
+            .find_map(|e| match e {
+                MachineEvent::TopologySynced { windows, .. } => Some(windows),
+                _ => None,
+            })
+            .expect("topology");
+        assert_eq!(windows[0].name, "my window|~|odd");
+        assert_eq!(windows[0].panes[0].cwd, "/home/a b");
+        assert_eq!(windows[0].panes[0].title, "vim: a|~|b.txt");
+    }
+
+    #[test]
+    fn typed_commands_keep_replies_in_step_however_many_they_run() {
+        let mut machine = TmuxMachine::new(120, 40, 0, 5);
+        machine.feed(
+            b"%begin 1 1 0\n%end 1 1 0\n\
+              %begin 1 2 1\n%end 1 2 1\n\
+              %begin 1 3 1\n%end 1 3 1\n\
+              %begin 1 4 1\n%end 1 4 1\n\
+              %begin 1 5 1\n%end 1 5 1\n\
+              %begin 1 6 1\n%end 1 6 1\n",
+        );
+        // Sent unchanged: quoted `;` stays part of the argument.
+        let sent = machine.queue_raw_command(
+            r#"display -p "a;b" ; if-shell true { display -p x ; display -p y }"#,
+        );
+        assert_eq!(
+            sent,
+            "display -p \"a;b\" ; if-shell true { display -p x ; display -p y }\n\
+             display-message -p rooste-sync-1\n"
+        );
+        machine.queue_sync_topology(&mut String::new(), false);
+        // tmux 3.5a: one block each for display, if-shell, x and y, then the marker.
+        let events = machine.feed(
+            b"%begin 1 7 1\na;b\n%end 1 7 1\n\
+              %begin 1 8 1\n%end 1 8 1\n\
+              %begin 1 9 1\nx\n%end 1 9 1\n\
+              %begin 1 10 1\ny\n%end 1 10 1\n\
+              %begin 1 11 1\nrooste-sync-1\n%end 1 11 1\n\
+              %begin 1 12 1\n@0|~|1|~|b25f,120x40,0,0,0|~|dev\n%end 1 12 1\n\
+              %begin 1 13 1\n@0|~|%0|~|1|~|120|~|40|~|/home|~|sh\n%end 1 13 1\n",
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            MachineEvent::TopologySynced { windows, .. } if windows.len() == 1 && windows[0].name == "dev"
+        )));
     }
 }

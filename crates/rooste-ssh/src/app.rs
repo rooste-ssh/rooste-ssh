@@ -1170,30 +1170,10 @@ impl RoosteApp {
 
     fn handle_tmux_notification(&mut self, gateway_tab_id: u64, notification: TmuxNotification) {
         match notification {
-            TmuxNotification::WindowClose { window } => {
-                let to_remove: Vec<TileId> = self
-                    .tree
-                    .tiles
-                    .iter()
-                    .filter_map(|(tile_id, tile)| match tile {
-                        Tile::Pane(tab)
-                            if matches!(
-                                tab.tmux_role,
-                                TmuxRole::Pane {
-                                    gateway_tab_id: gw,
-                                    window_id: wid,
-                                    ..
-                                } if gw == gateway_tab_id && wid == window
-                            ) =>
-                        {
-                            Some(*tile_id)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for tile_id in to_remove {
-                    self.remove_tab_locally(tile_id);
-                }
+            TmuxNotification::WindowClose { .. } => {
+                // tmux also sends this when a window is only unlinked from
+                // another session that shares it, so the tabs stay until the
+                // topology refresh the machine queued shows the window is gone.
             }
             TmuxNotification::PaneExited { pane } => {
                 if let Some(tile_id) = self.find_tmux_pane_tile(gateway_tab_id, pane) {
