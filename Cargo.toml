@@ -59,7 +59,7 @@ rand = "0.10.3"
 rfd = "0.18.0"
 rhai = { version = "1.26.1", default-features = false, features = ["std"] }
 rpassword = "7.5.4"
-russh-sftp = "3.0.1"
+russh-sftp = "4.0.0"
 russh = { version = "0.65.0", default-features = false, features = ["ring", "flate2", "rsa"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
